@@ -1,6 +1,6 @@
 # Flanders — Implementation Plan
 
-> **Status:** Phase 0 (project foundation) COMPLETE. Go module (`module flanders`,
+> **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 begun — 1.1 (Config loader) COMPLETE. Go module (`module flanders`,
 > go 1.24), layout (`src/cmd/flanders` + `src/lib/{paths,logging}`), file-backed
 > slog logger, and paths helper all exist with passing tests; first tag `0.0.1` cut.
 > `go build ./...`, `go vet ./...`, and `go test ./...` are all green.
@@ -51,13 +51,13 @@
 
 ## Phase 1 — Config & data model (`src/lib` core)  `[depends: 0]`
 
-- [ ] **1.1 Config loader.** Parse `.flanders/config.toml` → typed struct with the
-  *(Next priority. Requires a TOML library — decision pending: `github.com/BurntSushi/toml` vs `github.com/pelletier/go-toml/v2`; needs network access for `go get`/`go mod download`.)*
+- [x] **1.1 Config loader.** Parse `.flanders/config.toml` → typed struct with the
   full schema in `03-config.md` (`[paths] [commands] [agent] [phases.*]
   [subagents] [context] [guardrails] [usage] [git]`). Apply documented defaults;
   **error if `[commands].test` missing for build**. *Acceptance:* loads the sample
   config and a minimal config (defaults fill in); missing test command rejected
   for build phase. (`03-config.md`)
+  (Implemented in `src/lib/config` (package `config`): `Config` struct mirrors every `03-config.md` section; `Default()` returns all documented defaults; `Load(path)` overlays the file on top of `Default()` (absent keys keep defaults, present keys win); `Validate()` checks enums/ranges; `ValidateForBuild()` enforces the required `[commands].test`. TOML library decision RESOLVED: `github.com/BurntSushi/toml v1.4.0` (mature/stable; supports `encoding.TextUnmarshaler` for duration fields and a custom `UnmarshalTOML` for the mixed `[subagents]` section). `[commands].test` intentionally has NO default (a default would make "missing" undetectable); it is enforced by `ValidateForBuild`, not `Load`. Duration fields (`iteration_timeout`, `backoff`) parse into a `config.Duration` (wraps `time.Duration`). Per-class subagent overrides (`[subagents.<name>]`) are parsed into `Subagents.Classes` (forward-compat; OPEN for v1). All config tests pass; `go build/vet/test ./...` green.)
 - [ ] **1.2 `flanders init`.** Write a commented default `config.toml` when absent.
   *(Note: `init` is referenced in `03-config.md` but absent from the command
   surface in `00-overview.md` — see Findings.)* *Acceptance:* `init` produces a
@@ -268,7 +268,9 @@
    `03-config.md`. Define it (task 8.2) — candidate `[paths].notes`.
 5. **Model→context-window table is OPEN** (`03-config.md`) but **required** to turn
    token counts into a % when `window_tokens = 0` (task 2.2). Either ship a small
-   model→window map or require the number; decide before 2.2.
+   model→window map or require the number; decide before 2.2. (Loader side ready:
+   `config` already accepts `window_tokens = 0` as the "auto-detect by model"
+   sentinel; only the model→window map itself remains for 2.2.)
 6. **Plan-completeness method is OPEN** (`06`) — agent self-assessment vs. coverage
    check vs. (rejected) user approval. Pick one for task 4.3.
 7. **Stale spec note** — multiple specs say "the harness's own directory is not yet
@@ -283,6 +285,7 @@
 ## Build conventions
 
 - Module `flanders`; packages under `src/`, imported as `flanders/src/lib/<pkg>`. Build/test/vet/run commands are in AGENTS.md. First green tag: `0.0.1`.
+- First external dependency: `github.com/BurntSushi/toml v1.4.0` (config parsing); `go.sum` now exists.
 
 ## Working agreements (from PROMPTs)
 
