@@ -225,6 +225,40 @@ risk structurally:** there is a dedicated, out-of-band event with a clean epoch.
   `is_error` / non-zero exit on the `result`). Misclassifying a limit as an error
   would abort an unattended multi-day run.
 
+### Classification (PINNED — `src/lib/stream` task 2.3)
+
+`LoopObservation.Classify(exitCode int) → {success | usage_limit | error}` is the
+single decision the loop driver and the usage-wait guardrail branch on. Rules,
+in order (usage-limit checked FIRST — it must win over the generic error path):
+
+1. **usage_limit** if `LoopObservation.UsageLimited`. That flag is set
+   comprehensively during the fold from EITHER signal:
+   - the out-of-band `rate_limit_event` with a non-`"allowed"`/non-empty `status`
+     (the clean, primary path), OR
+   - a usage-limit **`result`** — `api_error_status` containing `429`, or the
+     result text matching a known limit phrase (`usage limit reached`,
+     `usage limit exceeded`, `rate limit exceeded`, `rate_limit_error`,
+     `too many requests`, case-insensitive). HTTP **529 (overloaded) is NOT a
+     usage limit** — it is transient server overload and stays on the error path.
+2. **error** if `is_error`, a non-empty `api_error_status`, or a non-zero process
+   exit. (A bare non-zero exit with no result — e.g. a timeout kill — is an error:
+   the supervisor's exit code is the signal when a killed stream never reaches a
+   `result`.)
+3. **success** otherwise. NB: "success" means the *invocation* ran clean, **not**
+   that the task is done — done-ness is the test gate's call (`01` §done-detection).
+
+**Reset time.** Trust order: (1) the `rate_limit_event` epoch (`resetsAt`);
+(2) an epoch parsed from the result text — the historical
+`Claude AI usage limit reached|<epoch>` form, `<epoch>` being Unix seconds after
+the final `|` (millisecond epochs tolerated). The event epoch overrides a
+text-parsed one regardless of event order. When neither is present, `ResetAt` is
+nil and the caller (guardrail 3.12) falls back to `[usage].backoff`.
+
+**Bias.** The exact exhausted wording is still unverified (see OPEN), so the
+phrase/`status` matching leans toward *treating ambiguous limit-like signals as a
+limit* (pause) rather than aborting an unattended run; `[usage].max_cycles` caps
+any runaway wait loop.
+
 ## Subagents — spawns, naming, and attribution
 
 A **subagent spawn** is a `tool_use` block whose `name` is **`Agent`** (CLI
@@ -264,7 +298,11 @@ A **subagent spawn** is a `tool_use` block whose `name` is **`Agent`** (CLI
 
 - Exact `status` wording in `rate_limit_event.rate_limit_info` when the window is
   **exhausted** (only `"allowed"` captured; no real limit triggered). Also the
-  full set of error `result.subtype` values.
+  full set of error `result.subtype` values. The classifier above (task 2.3) is a
+  best-effort heuristic chosen *because* of this gap — it matches known phrasings
+  and an API 429 conservatively, biased toward pausing. **Re-verify against a real
+  limited transcript when one can be captured** and tighten the phrase set if the
+  observed wording differs.
 - Whether cache tokens genuinely count toward the context window for the pressure
   estimate. **Decision regardless:** over-count (include cache) so trips fire early.
 - **Outbound** (`--input-format stream-json`) message envelope for the soft

@@ -2,7 +2,8 @@
 
 > **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 COMPLETE — all of
 > 1.1–1.6 done. Phase 2.1 COMPLETE — stream-json parser. Phase 2.2 COMPLETE —
-> live context-occupancy tracker. Go module (`module
+> live context-occupancy tracker. Phase 2.3 COMPLETE — usage-limit detection +
+> reset parse. Go module (`module
 > flanders`, go 1.24), layout (`src/cmd/flanders` + `src/lib/{paths,logging,
 > config,task,state,journal,stream}`), file-backed slog logger, paths helper,
 > config loader + default-file writer, the task-file model, the task
@@ -16,9 +17,9 @@
 > real dispatcher: `init` → writes a commented default config; bare `flanders` →
 > orchestrate startup; `discuss|plan|build` → honest "not implemented yet" error;
 > unknown → usage error (stdlib only, no CLI framework). `Version` const is
-> `0.0.9`; tag `0.0.9` will be created. `go build ./...`, `go vet ./...`, and
-> `go test ./...` are all green. **Next up: Phase 2.3 (Usage-limit
-> detection + reset parse)**.
+> `0.0.10`; tag `0.0.10` will be created. `go build ./...`, `go vet ./...`, and
+> `go test ./...` are all green. **Next up: Phase 2.4 (CLI invocation
+> builder)**.
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -324,10 +325,39 @@
   spuriously hard-trip. NOT yet wired into a live loop (no loop driver until
   Phase 3); the guardrail CONSUMER is task 3.11, the process-supervisor seam is
   2.5. `go build/vet/test ./...` all green; `Version` bumped to 0.0.9.)
-- [ ] **2.3 Usage-limit detection + reset parse.** Classify an error `result` /
+- [x] **2.3 Usage-limit detection + reset parse.** Classify an error `result` /
   non-zero exit as usage-limit vs. genuine error; extract `reset_at` (or fall back
   to `[usage].backoff`). *Acceptance:* known limit payloads → wait+reset; ordinary
   errors → error path. **Riskiest parse — verify wording vs 2.1.x.** (`08`, `01`)
+  (Implemented in NEW file `src/lib/stream/classify.go` (`Outcome` enum
+  `OutcomeSuccess|OutcomeUsageLimit|OutcomeError` + `String()`;
+  `LoopObservation.Classify(exitCode int) Outcome`; `isUsageLimitResult`;
+  `parseResetFromText`) + `classify_test.go` (9 tests). KEY DESIGN: `Classify` is
+  the single 3-way decision the loop driver (3.1) and usage-wait guardrail (3.12)
+  branch on, describing the INVOCATION outcome NOT task completion (done-ness stays
+  the test gate's call). Usage-limit is checked FIRST and wins over the generic
+  error path — misclassifying a limit as an error would abort an unattended
+  multi-day run (spec 08). `UsageLimited` is now COMPREHENSIVE: still set from the
+  out-of-band `rate_limit_event` (existing), and NOW ALSO from a usage-limit result
+  — folded in `observe.go`'s `TypeResult` case via `isUsageLimitResult`
+  (`api_error_status` containing 429, or result text matching `usage limit
+  reached|usage limit exceeded|rate limit exceeded|rate_limit_error|too many
+  requests`, case-insensitive). HTTP 529 (overloaded) is deliberately NOT a usage
+  limit (transient server overload → error path). Reset extraction trust order:
+  (1) `rate_limit_event` epoch, (2) `parseResetFromText` pulls a Unix epoch after
+  the final `|` in the historical `Claude AI usage limit reached|<epoch>` message
+  (ms epochs tolerated); the event epoch overrides a text-parsed one regardless of
+  event order (fold only fills `ResetAt` from text when still nil, and the event
+  path always overwrites). No backoff fallback in the stream package — that needs
+  config, so the guardrail (3.12) applies `[usage].backoff` when `ResetAt` is nil.
+  WHY synthetic test inputs not a `.jsonl` fixture: a real subscription limit could
+  not be triggered to capture (spec 08 OPEN), so the limit transcripts are
+  inline+labelled synthetic; the existing real `*.jsonl` fixtures (status
+  `allowed`, success results) are unaffected (verified: their result text contains
+  no limit phrase, `api_error_status` null). spec 08 updated: the classifier is now
+  PINNED (best-effort heuristic, biased toward pausing per `max_cycles` cap) with a
+  re-verify-against-real-limit note left in OPEN. Version bumped to 0.0.10; tag
+  0.0.10. `go build/vet/test ./...` all green.)
 - [ ] **2.4 CLI invocation builder.** Compose `claude` args from config/phase: `-p`,
   `--output-format stream-json --verbose --include-partial-messages`, fresh
   `--session-id <uuid>` (no resume/continue), permission mode
@@ -491,8 +521,11 @@
    2.1 DONE). The riskiest-parse concern (usage-limit detection) is structurally
    de-risked: `rate_limit_event` carries a clean epoch `resetsAt` — no text-
    scraping required. The exact exhausted-status string (how to distinguish a
-   usage-limit `result` from a genuine error) is still OPEN and will be pinned in
-   task **2.3**. Remaining risk: tasks **2.2–2.3**.
+   usage-limit `result` from a genuine error) is now DONE in task **2.3**: the
+   classifier is implemented and spec 08 PINNED as a best-effort heuristic (matches
+   known phrasings + API 429, biased toward pausing), with the exact exhausted
+   wording still to be re-verified against a real captured limit. Remaining risk:
+   tasks **2.4–2.5** (CLI invocation builder + process supervisor).
 2. **`state.json`** → authored `specs/09-state-and-resume.md` (draft) and IMPLEMENTED
    in `src/lib/state` (task 1.5 done). Persistence + recovery (missing/corrupt →
    rebuild from task store) are complete; the RUNNING-crash git-reconcile path is

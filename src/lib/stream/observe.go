@@ -38,9 +38,13 @@ type LoopObservation struct {
 	ResultText     string
 	APIErrorStatus string // non-empty ⇒ API-level error; a classification hint for usage-limit detection (2.3)
 
-	// Usage-window state, from rate_limit_event(s). ResetAt is the parsed window
-	// reset (nil if never reported); UsageLimited is true once the window is
-	// exhausted. The usage-wait guardrail (3.12) consumes these.
+	// Usage-window state. UsageLimited is true once a subscription usage/rate
+	// window is exhausted — set from EITHER an out-of-band rate_limit_event OR a
+	// usage-limit `result` (api_error_status 429 / "usage limit reached" text; see
+	// [LoopObservation.Classify]). ResetAt is the parsed window reset (nil if never
+	// reported): the rate_limit_event epoch when present, else an epoch parsed from
+	// the result text. The usage-wait guardrail (3.12) consumes these and falls
+	// back to [usage].backoff when ResetAt is nil.
 	UsageLimited  bool
 	ResetAt       *time.Time
 	RateLimitType string
@@ -224,6 +228,18 @@ func (o *LoopObservation) fold(ev *Event, results map[string]toolResult) {
 		for _, mu := range r.ModelUsage {
 			if mu.ContextWindow > o.ContextWindow {
 				o.ContextWindow = mu.ContextWindow
+			}
+		}
+		// A usage-limit can surface only as an error result (no out-of-band
+		// rate_limit_event). Detect it here so UsageLimited is comprehensive and the
+		// reset is as precise as the wire allows — without overwriting a cleaner
+		// epoch the rate_limit_event already supplied. See classify.go.
+		if isUsageLimitResult(r.APIErrorStatus, r.Result) {
+			o.UsageLimited = true
+			if o.ResetAt == nil {
+				if t, ok := parseResetFromText(r.Result); ok {
+					o.ResetAt = &t
+				}
 			}
 		}
 
