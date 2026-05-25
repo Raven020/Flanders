@@ -75,6 +75,10 @@ Implications that shape the whole design:
 - `05-discuss.md` — interactive spec-authoring chat.
 - `06-orchestration.md` — bare-command plan↔build orchestration.
 - `07-agents-and-models.md` — agent classes, models/effort, TDD test agent.
+- `08-stream-json-protocol.md` — the `claude` event-stream contract the
+  TUI/journal/guardrails parse (draft; wire shapes to pin vs CLI 2.1.x).
+- `09-state-and-resume.md` — `state.json` schema + crash/usage-wait resume
+  semantics (draft).
 
 ## Keyword index — where to look
 
@@ -93,6 +97,8 @@ specs/` lands on the right file. Common topics → spec:
 | discuss phase, interactive chat, spec authoring, granularity authority | `05-discuss.md` |
 | orchestration, plan↔build, drain/batch-replan, autonomy, bare command | `06-orchestration.md` |
 | agents, models, effort, subagents, TDD test agent, test→build→verify | `07-agents-and-models.md` |
+| stream-json events, parser, live token tracking, usage-limit reset parse | `08-stream-json-protocol.md` |
+| `state.json`, resume, crash recovery, run-state cache, ground-truth tiers | `09-state-and-resume.md` |
 | auth/usage model (subscription), command surface, project vision | `00-overview.md` |
 
 ## Remaining open decisions (tracked)

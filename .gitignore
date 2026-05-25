@@ -1,0 +1,6 @@
+# Flanders runtime working directory (journal, state.json, logs) — derived,
+# never source. Task files and the derived plan live in specs/ and the repo root.
+/.flanders/
+
+# Compiled binary (built on demand via `go build`/`go run`).
+/flanders
