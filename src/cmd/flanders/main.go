@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 
+	"flanders/src/lib/journal"
 	"flanders/src/lib/logging"
 	"flanders/src/lib/paths"
 	"flanders/src/lib/state"
@@ -20,7 +21,7 @@ import (
 
 // Version is the harness version, bumped on each green build (PROMPT rule:
 // start at 0.0.0 and increment patch).
-const Version = "0.0.1"
+const Version = "0.0.6"
 
 func main() {
 	if err := run(); err != nil {
@@ -71,5 +72,20 @@ func run() error {
 	}
 	log.Info("run state loaded", "rebuilt", rebuilt, "phase", st.Phase,
 		"run_state", st.RunState, "current_task", st.CurrentTask)
+
+	// Open the per-loop journal (spec 01 §journal). It is the tier-2 history the
+	// loop driver (Phase 3) appends to and the TUI renders; opening it here makes
+	// the directory ready and surfaces how many loops this project has on record —
+	// the depth the orchestrator will fold into a rebuilt state.Iter (the
+	// journal-tier enrichment state.Rebuild defers to this tier, spec 09).
+	jrnl, err := journal.Open(p.Journal)
+	if err != nil {
+		return fmt.Errorf("open journal: %w", err)
+	}
+	depth, err := jrnl.Len()
+	if err != nil {
+		return fmt.Errorf("read journal: %w", err)
+	}
+	log.Info("journal opened", "dir", jrnl.Dir(), "entries", depth)
 	return nil
 }

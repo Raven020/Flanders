@@ -1,14 +1,16 @@
 # Flanders — Implementation Plan
 
 > **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 in progress — 1.1
-> (Config loader), 1.3 (Task-file model), 1.4 (Task store / selector), and 1.5
-> (State persistence) COMPLETE. Go module (`module flanders`, go 1.24), layout
-> (`src/cmd/flanders` + `src/lib/{paths,logging,config,task,state}`), file-backed
-> slog logger, paths helper, config loader, the task-file model, the task
-> store/selector, and the state cache (`src/lib/state`, wired into `main` for
-> startup load) all exist with passing tests. `go build ./...`, `go vet ./...`,
-> and `go test ./...` are all green. **Next up: 1.6 Journal writer** (tier-2
-> history; also feeds state rebuild) and 1.2 (`flanders init`).
+> (Config loader), 1.3 (Task-file model), 1.4 (Task store / selector), 1.5
+> (State persistence), and 1.6 (Journal writer) COMPLETE. Go module (`module
+> flanders`, go 1.24), layout (`src/cmd/flanders` +
+> `src/lib/{paths,logging,config,task,state,journal}`), file-backed slog logger,
+> paths helper, config loader, the task-file model, the task store/selector, the
+> state cache (`src/lib/state`, wired into `main` for startup load), and the
+> journal (`src/lib/journal`, wired into `main` after state load) all exist with
+> passing tests. `go build ./...`, `go vet ./...`, and `go test ./...` are all
+> green. **Next up: 1.2 (`flanders init`)** to finish Phase 1, then Phase 2 (2.1
+> Stream-json parser).
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -157,10 +159,52 @@
   config-derived fields would write a half-derived cache; the orchestrator (Phase 5)
   owns when to first persist. Schema-migration policy on a future `schema_version`
   bump = rebuild-from-truth (treat unknown version as corrupt) — OPEN in spec 09.)
-- [ ] **1.6 Journal writer** (`.flanders/journal/`, `01` §journal). Per-loop
+- [x] **1.6 Journal writer** (`.flanders/journal/`, `01` §journal). Per-loop
   record: raw stream-json + summary (task, files touched, test result, cost,
   tokens, duration, session id). Append-only; readable back for the TUI history.
   *Acceptance:* a loop produces a re-readable journal entry.
+  (Implemented in NEW package `src/lib/journal` (package `journal`), stdlib
+  `encoding/json` only — NO new external dependency. TWO FILES PER LOOP keyed by
+  an append-order seq: `<seq:06d>.json` (the `Summary` — task, files touched,
+  test result, cost, tokens, duration, session id, status transition, subagents)
+  + `<seq:06d>.stream.jsonl` (the verbatim raw NDJSON transcript). WHY two files:
+  the spec says "raw stream-json PLUS a short summary"; the split lets the TUI
+  history list render N tiny Summary parses without ever reading the (potentially
+  huge) transcripts — drill-in loads one stream on demand.
+  WRITE-ORDER INVARIANT: stream is written FIRST, summary LAST. The summary is
+  the entry's commit marker (`List`/`Last`/`nextSeq` all key off `*.json`). A
+  crash between writes leaves an orphan stream that `List` ignores and the next
+  `Append`'s seq reuse overwrites — so failed writes neither leak seq numbers nor
+  accumulate junk. Both writes are atomic (temp-in-same-dir + rename, same
+  discipline as `state.Save`/`task.WriteFile`).
+  JOURNAL OWNS THE SEQ (allocated as max-existing-filename + 1, caller's
+  `Summary.Seq` is ignored/overwritten): keeps it a self-contained append-only
+  log whose ordering can't be corrupted by a stale/duplicate caller index — the
+  independence the spec-09 tier hierarchy needs (journal is tier 2; state.json is
+  the tier-3 cache). Seq resumes across process restarts (a fresh `Open` of a
+  populated dir continues numbering).
+  RESILIENT `List()` skips unreadable/unparseable summaries (mirrors the stream
+  parser's skip-bad-lines rule) so the TUI history renders even if one entry is
+  damaged; only a dir-level glob failure errors. `Read(seq)` is strict — returns
+  `*CorruptError` for a damaged entry, error wrapping `os.ErrNotExist` for a
+  missing one.
+  DECOUPLED from the not-yet-built stream-json parser (Phase 2.1): the journal is
+  a PERSISTENCE concern only. `Summary` holds primitive fields the loop driver
+  (Phase 3) fills from a future `LoopObservation`; `Append(s, raw io.Reader)`
+  takes the raw transcript bytes to archive. So the on-disk record format has one
+  owner (this package) and survives wire-protocol changes. Imports `src/lib/task`
+  only, for the `Status`/`Reason` enums in the status-transition fields (single
+  source of truth, no redefined strings).
+  API: `Open(dir)`, `Append(*Summary, io.Reader) (seq, error)`, `List()
+  ([]*Summary, error)` (seq-ordered), `Read(seq)`, `ReadStream(seq)
+  (io.ReadCloser, error)`, `Last() (*Summary, error)` (nil,nil when empty),
+  `Len()`. Helpers: `Tokens.Total()` (input+cache_read+cache_creation+output —
+  matches spec-08 occupancy sum), `TestResult.Passed()` (Ran && exit 0; `Ran`
+  distinguishes "tests not run this loop" from "ran and passed").
+  WIRED into `src/cmd/flanders/main.go` startup: opens the journal after state
+  load and logs `entries=<depth>` — the history depth the orchestrator will fold
+  into a rebuilt `state.Iter`.
+  10 tests + full suite green; `Version` const bumped to 0.0.6.)
 
 ## Phase 2 — Agent integration & stream-json  `[depends: 1; highest technical risk]`
 
@@ -342,8 +386,12 @@
 2. **`state.json`** → authored `specs/09-state-and-resume.md` (draft) and IMPLEMENTED
    in `src/lib/state` (task 1.5 done). Persistence + recovery (missing/corrupt →
    rebuild from task store) are complete; the RUNNING-crash git-reconcile path is
-   deferred to Phase 3.5 and journal-tier rebuild to 1.6. The usage-wait/resume
-   *consumer* of this state is still task **3.12**.
+   deferred to Phase 3.5. Journal-tier rebuild (task 1.6) is NOW DONE: the
+   `src/lib/journal` package exists and exposes `Last()`/`Len()`/`List()` as the
+   seam for journal-tier state rebuild; the actual enrichment of
+   `state.Iter`/`last_session_id` from the journal still belongs to the
+   orchestrator (Phase 5), since `state.Rebuild` itself stays ground-truth-only.
+   The usage-wait/resume *consumer* of this state is still task **3.12**.
 3. **`flanders init` inconsistency** — referenced in `03-config.md` ("missing →
    `flanders init` …") but **absent from the command surface** in `00-overview.md`.
    Reconcile (add `init` to the surface, or fold default-writing into bare run).
@@ -372,7 +420,8 @@
 - External dependencies: `github.com/BurntSushi/toml v1.4.0` (config parsing, TOML);
   `gopkg.in/yaml.v3 v3.0.1` (task-file frontmatter, YAML — node-based for lossless
   round-trip). Config is TOML, task files are YAML — both by spec design. State
-  (`src/lib/state`) uses stdlib `encoding/json` only — no new dependency.
+  (`src/lib/state`) and journal (`src/lib/journal`) both use stdlib `encoding/json`
+  only — no new dependency.
 
 ## Working agreements (from PROMPTs)
 
