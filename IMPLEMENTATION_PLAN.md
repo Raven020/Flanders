@@ -1,12 +1,13 @@
 # Flanders — Implementation Plan
 
 > **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 in progress — 1.1
-> (Config loader) and 1.3 (Task-file model) COMPLETE. Go module (`module flanders`,
-> go 1.24), layout (`src/cmd/flanders` + `src/lib/{paths,logging,config,task}`),
-> file-backed slog logger, paths helper, config loader, and the task-file model all
-> exist with passing tests. `go build ./...`, `go vet ./...`, and `go test ./...`
-> are all green. **Next up: 1.4 Task store / selector** (now unblocked — it
-> consumes `src/lib/task`), then 1.2/1.5/1.6.
+> (Config loader), 1.3 (Task-file model), and 1.4 (Task store / selector)
+> COMPLETE. Go module (`module flanders`, go 1.24), layout (`src/cmd/flanders` +
+> `src/lib/{paths,logging,config,task}`), file-backed slog logger, paths helper,
+> config loader, the task-file model, and the task store/selector all exist with
+> passing tests. `go build ./...`, `go vet ./...`, and `go test ./...` are all
+> green. **Next up: 1.5 State persistence** (consumes the task store for
+> rebuild), then 1.2 (`flanders init`) and 1.6 (Journal writer).
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -88,10 +89,34 @@
   mistaken for it; CRLF and a leading BOM are tolerated. `WriteFile` is atomic
   (temp-in-same-dir + rename). NEW DEP: `gopkg.in/yaml.v3 v3.0.1` (task files are
   YAML by design; config stays TOML). All task tests + full suite green.)
-- [ ] **1.4 Task store / selector.** Enumerate `specs/tasks/*.md`; select the next
+- [x] **1.4 Task store / selector.** Enumerate `specs/tasks/*.md`; select the next
   actionable task = `pending` with **all `deps` `done`**; never select a task with
   unmet deps. Detect dependency cycles. *Acceptance:* selector returns correct
   next task across dep graphs; cycle surfaced as error. (`01` §select, `02` §deps)
+  (Implemented in `src/lib/task/store.go` (same package `task`, NOT a new package —
+  it operates directly on `*Task` and the prompt's "consolidate in `src/lib`" rule
+  argues against a thin wrapper package; `task.Store` reads naturally). API:
+  `LoadDir(dir)` globs `*.md`, parses+`Validate()`s each (fail-fast on the first
+  malformed file, with path), builds the store; a MISSING tasks dir is NOT an error
+  → empty store (the expected pre-plan state). `NewStore([]*Task)` is the test/state-
+  rebuild seam. `Store.Next() (*Task, error)` returns the lowest-id `pending` task
+  whose deps all resolve to `done`; returns `(nil,nil)` when nothing is actionable.
+  `AllDone()` distinguishes "finished" (Next nil + AllDone) from "stalled" (Next nil
+  + !AllDone). `Validate()` does the cross-task graph check (unknown deps + cycles);
+  `CheckCycles()` is the standalone 3-color DFS. KEY DESIGN — id normalization lives
+  HERE, not in `task.go`: because task.go stores `id`/`deps` verbatim to round-trip
+  zero-padding, the store owns collapsing `0007`/`7`/`07` to one key via `normID`
+  (trim space; strip leading zeros from all-digit ids, keeping a lone `0`); it is the
+  ONLY place ids are compared, so a dep `0001` resolves to task `1`. Cycles are an
+  ERROR not a silent nil (a cycle would otherwise masquerade as a finished plan) —
+  `Next` runs full-graph cycle detection first and returns `*CycleError` naming the
+  loop. Typed errors: `*CycleError` (with `Cycle []string`), `*UnknownDepError`,
+  `*DuplicateIDError` (two files → same normalized id, rejected at load). Selection
+  order is numeric-when-both-numeric (so 2 < 10), lexicographic otherwise, fixed once
+  at load. NOTE for 1.5: `NewStore` is the rebuild entry point; an unknown dep makes a
+  task non-actionable in `Next` (skipped) but is only surfaced as an error by the
+  explicit `Validate()`, so `Next` stays robust on a half-built plan. 13 new tests +
+  full suite green.)
 - [ ] **1.5 State persistence** (`state.json`, `09-state-and-resume.md`). Atomic
   write (temp+rename) on every transition; load on startup; rebuild from task
   files+journal+git when missing/corrupt. *Acceptance:* round-trip; corrupt file
