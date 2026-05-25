@@ -3,9 +3,10 @@
 > **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 COMPLETE — all of
 > 1.1–1.6 done. Phase 2.1 COMPLETE — stream-json parser. Phase 2.2 COMPLETE —
 > live context-occupancy tracker. Phase 2.3 COMPLETE — usage-limit detection +
-> reset parse. Go module (`module
+> reset parse. Phase 2.4 COMPLETE — CLI invocation builder (`src/lib/invoke`:
+> pure argv composer + fresh session-id minting). Go module (`module
 > flanders`, go 1.24), layout (`src/cmd/flanders` + `src/lib/{paths,logging,
-> config,task,state,journal,stream}`), file-backed slog logger, paths helper,
+> config,task,state,journal,stream,invoke}`), file-backed slog logger, paths helper,
 > config loader + default-file writer, the task-file model, the task
 > store/selector, the state cache (`src/lib/state`, wired into `main` for startup
 > load), the journal (`src/lib/journal`, wired into `main` after state load), and
@@ -17,9 +18,8 @@
 > real dispatcher: `init` → writes a commented default config; bare `flanders` →
 > orchestrate startup; `discuss|plan|build` → honest "not implemented yet" error;
 > unknown → usage error (stdlib only, no CLI framework). `Version` const is
-> `0.0.10`; tag `0.0.10` will be created. `go build ./...`, `go vet ./...`, and
-> `go test ./...` are all green. **Next up: Phase 2.4 (CLI invocation
-> builder)**.
+> `0.0.11`; tag `0.0.11` will be created. `go build ./...`, `go vet ./...`, and
+> `go test ./...` are all green. **Next up: Phase 2.5 (process supervisor)**.
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -358,13 +358,50 @@
   PINNED (best-effort heuristic, biased toward pausing per `max_cycles` cap) with a
   re-verify-against-real-limit note left in OPEN. Version bumped to 0.0.10; tag
   0.0.10. `go build/vet/test ./...` all green.)
-- [ ] **2.4 CLI invocation builder.** Compose `claude` args from config/phase: `-p`,
+- [x] **2.4 CLI invocation builder.** Compose `claude` args from config/phase: `-p`,
   `--output-format stream-json --verbose --include-partial-messages`, fresh
   `--session-id <uuid>` (no resume/continue), permission mode
   (`--dangerously-skip-permissions`, LOCKED default), `--model`/`--effort`
   per-phase, `--append-system-prompt` (rules), `--input-format stream-json` when
   `stream_input`. **No `--max-budget-usd` by default** (subscription). *Acceptance:*
   builder emits expected argv per phase/config. (`01` §invocation, `03`)
+  (Implemented in NEW package `src/lib/invoke` (package `invoke`), stdlib only
+  (`crypto/rand`, `fmt`) — NO new external dependency. Files: `invoke.go` (`Spec`,
+  `Command`, `Build`, `NewSessionID`, `permissionArgs`) + `invoke_test.go` (11
+  tests) + a `TestPhaseClass` added to `src/lib/config/config_test.go`. The builder
+  is PURE: argv composition only, no process spawning (2.5) and no file I/O — the
+  caller resolves paths and reads the rules file, then hands `Build` a `Spec`. WHY
+  pure: makes the exact argv unit-testable (the acceptance, asserted by full-slice
+  equality in `TestBuildDefaultPlan`) and gives the supervisor (2.5) one audited
+  `Command{Bin,Args}` to launch (the shape `exec.CommandContext` wants).
+  Pinned invariants (cited inline in the source): baseline `-p --output-format
+  stream-json --verbose --include-partial-messages` ALWAYS emitted (required by
+  `src/lib/stream`); fresh `--session-id <uuid>` every loop (NEVER
+  `--resume`/`--continue`); permission mapping — `bypassPermissions` →
+  `--dangerously-skip-permissions` (LOCKED default), the other three modes →
+  `--permission-mode <mode>`; `--max-budget-usd` NEVER emitted (subscription, spec
+  00/01) — guarded by `TestNeverEmitsBudget`; `--input-format stream-json` ONLY when
+  `[agent].stream_input` (the soft-wind-down channel), and when on the prompt is
+  delivered over stdin so it is NOT placed in argv (else a duplicate turn); when
+  stream_input is off the prompt is the trailing positional to `claude -p`.
+  `--model`/`--effort` per-phase from config (always emitted). `--effort` is the
+  flag name (confirmed spec 07:15, NOT `--reasoning-effort`).
+  KEY DECISION — phase→class resolution lives in `config.PhaseClass(phase)`, NOT in
+  invoke: it is config INTERPRETATION (single source of truth); maps the four phases
+  to their `[phases.*]` table and `split` reuses `[phases.plan]` (spec 07). Unknown
+  phase = error (a typo surfaces at compose time, not as the wrong model silently).
+  This is the phase HALF of task 4.1, landed early because 2.4 needs it; the
+  SUBAGENT-class resolver (`[subagents]` default + per-class override merge) stays
+  with 4.1 — the harness only ever invokes phase (lead) agents (subagents are
+  spawned by the lead inside its own session), so the builder never needs a subagent
+  class.
+  `NewSessionID()` mints an RFC-4122 v4 UUID on `crypto/rand` (no external UUID
+  dep); the CALLER owns the id (Build requires non-empty SessionID, never invents
+  one) because it must also persist to journal/state for traceability (spec 01).
+  Build errors loudly on inputs it alone owns: empty SessionID, unknown phase, nil
+  config, unrecognized permission_mode. NOT yet wired into a live loop (loop driver
+  is Phase 3); CONSUMERS are the supervisor 2.5 and iteration driver 3.1. `go
+  build/vet/test ./...` all green. Version 0.0.11; tag 0.0.11.)
 - [ ] **2.5 Process supervisor.** Spawn/stream/wait the CLI; capture stdout(events)
   + stderr; enforce per-iteration timeout (kill); expose a writer for stream-json
   input injection (soft wind-down). *Acceptance:* runs a stub command, streams
@@ -415,7 +452,7 @@
 
 - [ ] **4.1 Agent-class resolution.** Map phase/subagent → model+effort from
   `[phases.*]`/`[subagents]` (+ overrides); `split` reuses `plan`. *Acceptance:*
-  each class resolves to documented defaults unless overridden. (`07`,`03`)
+  each class resolves to documented defaults unless overridden. (`07`,`03`) *(NOTE: the phase→class half already landed with task 2.4 as `config.PhaseClass`, incl. split→plan; 4.1 now covers only the subagent `[subagents]` default + per-class override merge.)*
 - [ ] **4.2 Plan loop.** Read `specs/*.md` (non-task) → create/update
   `specs/tasks/*.md`: decompose to smallest-checkable, assign ids, wire `deps`,
   write `acceptance`. *Acceptance:* a sample spec yields well-formed task files
@@ -525,7 +562,7 @@
    classifier is implemented and spec 08 PINNED as a best-effort heuristic (matches
    known phrasings + API 429, biased toward pausing), with the exact exhausted
    wording still to be re-verified against a real captured limit. Remaining risk:
-   tasks **2.4–2.5** (CLI invocation builder + process supervisor).
+   task **2.5** (process supervisor; the CLI invocation builder 2.4 is now DONE in `src/lib/invoke`).
 2. **`state.json`** → authored `specs/09-state-and-resume.md` (draft) and IMPLEMENTED
    in `src/lib/state` (task 1.5 done). Persistence + recovery (missing/corrupt →
    rebuild from task store) are complete; the RUNNING-crash git-reconcile path is

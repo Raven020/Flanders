@@ -296,3 +296,31 @@ func TestWindowTokensZeroAllowed(t *testing.T) {
 		t.Errorf("window_tokens = %d, want 0", cfg.Context.WindowTokens)
 	}
 }
+
+// TestPhaseClass covers phase→class resolution including split→plan reuse and the
+// unknown-phase error (spec 07). This is the single source of truth the invoke
+// builder relies on, so a wrong mapping would silently run the wrong model.
+func TestPhaseClass(t *testing.T) {
+	c := Default()
+	cases := []struct {
+		phase, model, effort string
+	}{
+		{"discuss", "opus", "high"},
+		{"plan", "opus", "high"},
+		{"build", "opus", "high"},
+		{"test", "sonnet", "medium"},
+		{"split", "opus", "high"}, // split reuses plan
+	}
+	for _, tc := range cases {
+		got, err := c.PhaseClass(tc.phase)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.phase, err)
+		}
+		if got.Model != tc.model || got.Effort != tc.effort {
+			t.Errorf("%s: got %s/%s, want %s/%s", tc.phase, got.Model, got.Effort, tc.model, tc.effort)
+		}
+	}
+	if _, err := c.PhaseClass("bogus"); err == nil {
+		t.Error("expected error for unknown phase")
+	}
+}

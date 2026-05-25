@@ -383,6 +383,34 @@ func (c *Config) ValidateForBuild() error {
 	return nil
 }
 
+// PhaseClass returns the model+effort an agent should run with for a given phase.
+// It is the single source of truth for phase→class resolution (spec 07): the four
+// configured phases map to their [phases.*] table, and "split" deliberately reuses
+// [phases.plan] (split is not its own class — spec 07 §Two layers). An unknown
+// phase is an error rather than a silent default, so a typo surfaces at invocation
+// time instead of silently running the wrong model.
+//
+// Subagent-class resolution (the [subagents] default + per-class override merge)
+// is intentionally NOT here — the harness only ever invokes phase (lead) agents;
+// subagents are spawned by the lead inside its own session. That resolver lands
+// with the agent-class work that needs it (plan task 4.1).
+func (c *Config) PhaseClass(phase string) (AgentClass, error) {
+	switch phase {
+	case "discuss":
+		return c.Phases.Discuss, nil
+	case "plan":
+		return c.Phases.Plan, nil
+	case "build":
+		return c.Phases.Build, nil
+	case "test":
+		return c.Phases.Test, nil
+	case "split":
+		return c.Phases.Plan, nil // split reuses plan (spec 07)
+	default:
+		return AgentClass{}, fmt.Errorf("unknown phase %q (want discuss|plan|build|test|split)", phase)
+	}
+}
+
 func validateEffort(field, value string) error {
 	if !oneOf(value, validEfforts) {
 		return fmt.Errorf("%s %q: must be one of %s", field, value, strings.Join(validEfforts, ", "))
