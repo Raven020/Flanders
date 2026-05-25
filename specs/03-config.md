@@ -97,6 +97,16 @@ message_tmpl   = "Flanders: {phase} #{iter} — {task} [{result}]"
 
 ## Notes on the non-obvious fields
 
+- **`[commands]` starters vs. overlay-defaults.** The `go test`/`go build` in the
+  template above are **starters** `flanders init` writes for the common Go case
+  (edit them for your stack) — they are *not* the values the harness assumes when
+  a user OMITS the key. The omit-defaults differ: `test` has **no** default (it is
+  REQUIRED for the build phase; omitting it errors, so "missing" stays
+  detectable), while an omitted `build` defaults to `""` — **skip** the optional
+  pre-test compile check — exactly parallel to how `lint = ""` disables. Rationale:
+  an omitted *optional* command should mean "skip it," not "assume Go"; defaulting
+  an omitted `build` to `go build ./...` would be user-hostile on non-Go stacks and
+  inconsistent with `lint`.
 - **`permission_mode = bypassPermissions` (LOCKED).** Loops run with
   `--dangerously-skip-permissions` so headless `-p` never deadlocks on an
   unanswerable prompt. This is high-trust: the agent can run any tool/command.

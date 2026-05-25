@@ -3,7 +3,7 @@
 > Status: **in design**. This directory is the source of truth for what we are
 > building. Nothing is implemented yet. Sections marked `OPEN` are undecided.
 
-**Keywords:** overview · index · keyword-index · spec-map · commands · discuss · plan · build · auth · subscription · usage-model · vision
+**Keywords:** overview · index · keyword-index · spec-map · commands · init · discuss · plan · build · auth · subscription · usage-model · vision
 
 ## What it is
 
@@ -38,6 +38,7 @@ Implications that shape the whole design:
 
 | Command | Behaviour |
 |---|---|
+| `flanders init` | Write a commented default `.flanders/config.toml` (does not overwrite an existing one). |
 | `flanders discuss` | Interactive, harness-hosted chat to author `specs/*.md`. |
 | `flanders plan` | Ralph loop: turn `specs/*.md` into a task plan (`specs/tasks/*`). |
 | `flanders build` | Ralph loop: execute the plan until tests pass and all tasks are done. |

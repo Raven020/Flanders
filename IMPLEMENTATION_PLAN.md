@@ -1,16 +1,17 @@
 # Flanders — Implementation Plan
 
-> **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 in progress — 1.1
-> (Config loader), 1.3 (Task-file model), 1.4 (Task store / selector), 1.5
-> (State persistence), and 1.6 (Journal writer) COMPLETE. Go module (`module
-> flanders`, go 1.24), layout (`src/cmd/flanders` +
-> `src/lib/{paths,logging,config,task,state,journal}`), file-backed slog logger,
-> paths helper, config loader, the task-file model, the task store/selector, the
-> state cache (`src/lib/state`, wired into `main` for startup load), and the
-> journal (`src/lib/journal`, wired into `main` after state load) all exist with
-> passing tests. `go build ./...`, `go vet ./...`, and `go test ./...` are all
-> green. **Next up: 1.2 (`flanders init`)** to finish Phase 1, then Phase 2 (2.1
-> Stream-json parser).
+> **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 COMPLETE — all of
+> 1.1–1.6 done. Go module (`module flanders`, go 1.24), layout (`src/cmd/flanders`
+> + `src/lib/{paths,logging,config,task,state,journal}`), file-backed slog logger,
+> paths helper, config loader + default-file writer, the task-file model, the task
+> store/selector, the state cache (`src/lib/state`, wired into `main` for startup
+> load), and the journal (`src/lib/journal`, wired into `main` after state load)
+> all exist with passing tests. `src/cmd/flanders/main.go` now has a real
+> dispatcher: `init` → writes a commented default config; bare `flanders` →
+> orchestrate startup; `discuss|plan|build` → honest "not implemented yet" error;
+> unknown → usage error (stdlib only, no CLI framework). `Version` const is
+> `0.0.7`; tag `0.0.7` will be created. `go build ./...`, `go vet ./...`, and
+> `go test ./...` are all green. **Next up: Phase 2 (2.1 Stream-json parser)**.
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -65,10 +66,42 @@
   config and a minimal config (defaults fill in); missing test command rejected
   for build phase. (`03-config.md`)
   (Implemented in `src/lib/config` (package `config`): `Config` struct mirrors every `03-config.md` section; `Default()` returns all documented defaults; `Load(path)` overlays the file on top of `Default()` (absent keys keep defaults, present keys win); `Validate()` checks enums/ranges; `ValidateForBuild()` enforces the required `[commands].test`. TOML library decision RESOLVED: `github.com/BurntSushi/toml v1.4.0` (mature/stable; supports `encoding.TextUnmarshaler` for duration fields and a custom `UnmarshalTOML` for the mixed `[subagents]` section). `[commands].test` intentionally has NO default (a default would make "missing" undetectable); it is enforced by `ValidateForBuild`, not `Load`. Duration fields (`iteration_timeout`, `backoff`) parse into a `config.Duration` (wraps `time.Duration`). Per-class subagent overrides (`[subagents.<name>]`) are parsed into `Subagents.Classes` (forward-compat; OPEN for v1). All config tests pass; `go build/vet/test ./...` green.)
-- [ ] **1.2 `flanders init`.** Write a commented default `config.toml` when absent.
+- [x] **1.2 `flanders init`.** Write a commented default `config.toml` when absent.
   *(Note: `init` is referenced in `03-config.md` but absent from the command
-  surface in `00-overview.md` — see Findings.)* *Acceptance:* `init` produces a
-  loadable, commented config.
+  surface in `00-overview.md` — see Findings; now resolved.)* *Acceptance:* `init`
+  produces a loadable, commented config.
+  (Implemented in NEW file `src/lib/config/write.go` (same package `config`):
+  `const DefaultTOML` (the canonical commented template, mirrors spec 03's
+  "Proposed file" verbatim) + `func WriteDefault(path string) (wrote bool, err
+  error)`. WHY a hand-authored template string and not an encoder dump: the
+  BurntSushi TOML encoder cannot emit comments, and the comments ARE the value of
+  an init file. So `DefaultTOML` is the single canonical default-file text, and
+  `TestDefaultTOMLMatchesDefault` parses it back and asserts it equals `Default()`
+  (plus the `[commands]` starters) — an anti-drift lock so the template can never
+  silently diverge from the documented defaults.
+  KEY DECISION: the `[commands]` values in `DefaultTOML` (`test = "go test ./..."`,
+  `build = "go build ./..."`) are STARTERS for a Go project, NOT overlay-defaults.
+  `config.Default()` is deliberately left unchanged: `test` has no overlay-default
+  (required, detect-missing) and `build` overlay-defaults to `""` (omitted optional
+  build = skip the compile check, parallel to `lint`). So `init` writes a runnable
+  Go starter while `Default()` stays safe/stack-agnostic. The spec (03) has been
+  clarified to make this starter-vs-overlay-default distinction explicit (see
+  Finding 3 below).
+  `WriteDefault` NEVER overwrites an existing config (returns `wrote=false`, no
+  error) — `init` is for the missing-config case; a user's edits are precious.
+  Write is atomic (temp-in-same-dir + rename, same discipline as
+  `state.Save`/`task.WriteFile`); creates parent `.flanders/` via `MkdirAll`.
+  Command dispatch added to `src/cmd/flanders/main.go`: a thin pure `dispatch(args)`
+  switch — `init` → `runInit` → `initAt(root, w)` (factored out so it is testable
+  against a temp dir without chdir); bare `""` → `runOrchestrate()` (the former
+  `run()` startup, renamed); `discuss|plan|build` → honest "not implemented yet"
+  error; unknown → usage error. No CLI framework (stdlib only).
+  Tests: `src/lib/config/write_test.go` (round-trip/anti-drift lock, write-creates,
+  no-overwrite, no-temp-residue, empty-path) + `src/cmd/flanders/main_test.go`
+  (dispatch unknown/forthcoming, `initAt` writes loadable+build-ready config,
+  idempotency). `go build/vet/test ./...` all green. Acceptance ("init produces a
+  loadable, commented config") met — the generated config passes `Load` +
+  `ValidateForBuild`. `Version` const bumped to `0.0.7`.)
 - [x] **1.3 Task-file model** in `src/lib`. Parse/serialize **YAML frontmatter +
   markdown body**: `id`, `status` (pending|active|done|blocked), `reason`
   (required iff blocked; taxonomy `context-overreach|new-scope|dependency|error`),
@@ -392,9 +425,13 @@
    `state.Iter`/`last_session_id` from the journal still belongs to the
    orchestrator (Phase 5), since `state.Rebuild` itself stays ground-truth-only.
    The usage-wait/resume *consumer* of this state is still task **3.12**.
-3. **`flanders init` inconsistency** — referenced in `03-config.md` ("missing →
-   `flanders init` …") but **absent from the command surface** in `00-overview.md`.
-   Reconcile (add `init` to the surface, or fold default-writing into bare run).
+3. **`flanders init` inconsistency** — RESOLVED. `init` was referenced in
+   `03-config.md` ("missing → `flanders init` …") but absent from the command
+   surface in `00-overview.md`. Now resolved: `init` has been added to the command
+   surface in `specs/00-overview.md`, and `specs/03-config.md` has been clarified
+   to make the starter-vs-overlay-default `[commands]` nuance explicit (the
+   `DefaultTOML` template writes Go starters `test`/`build`; `config.Default()` is
+   unchanged and stack-agnostic). Task **1.2** is complete.
 4. **Operator-notes file undefined** — `04-tui.md` `i` writes "an operator-notes
    file the harness folds into that loop's prompt," but no path/format in
    `03-config.md`. Define it (task 8.2) — candidate `[paths].notes`.

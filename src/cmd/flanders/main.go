@@ -1,17 +1,20 @@
 // Command flanders wraps the claude CLI and drives a Ralph loop until the work
 // is provably complete (all tasks done, real tests green). See specs/00-overview.md.
 //
-// This is the foundation entry point: it locates the project root, ensures the
-// .flanders/ working directory exists, and starts the file-backed logger. The
-// full command surface (discuss|plan|build|init and bare orchestrate) lands in
-// later phases — see IMPLEMENTATION_PLAN.md.
+// Today the command surface is: `flanders init` (write a commented default
+// config) and the bare invocation (the orchestrate startup: locate the project
+// root, ensure .flanders/, load the run-state cache and journal). The remaining
+// surface (discuss|plan|build, and the orchestrate loop itself) lands in later
+// phases — see IMPLEMENTATION_PLAN.md.
 package main
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 
+	"flanders/src/lib/config"
 	"flanders/src/lib/journal"
 	"flanders/src/lib/logging"
 	"flanders/src/lib/paths"
@@ -21,16 +24,87 @@ import (
 
 // Version is the harness version, bumped on each green build (PROMPT rule:
 // start at 0.0.0 and increment patch).
-const Version = "0.0.6"
+const Version = "0.0.7"
+
+const usage = `usage: flanders [command]
+
+commands:
+  init      write a commented default .flanders/config.toml (never overwrites)
+  (bare)    orchestrate plan → build until the plan is complete and green
+
+forthcoming (later phases): discuss, plan, build`
 
 func main() {
-	if err := run(); err != nil {
+	if err := dispatch(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "flanders: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+// dispatch routes the command word to its handler. Keeping this a thin, pure
+// switch (no globals) makes it testable and gives the not-yet-built commands an
+// honest message instead of silently doing the wrong thing.
+func dispatch(args []string) error {
+	cmd := ""
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+	switch cmd {
+	case "init":
+		return runInit(args[1:])
+	case "":
+		return runOrchestrate()
+	case "discuss", "plan", "build":
+		return fmt.Errorf("command %q is not implemented yet — see IMPLEMENTATION_PLAN.md", cmd)
+	default:
+		return fmt.Errorf("unknown command %q\n\n%s", cmd, usage)
+	}
+}
+
+// runInit writes a commented default config.toml when the project has none
+// (spec 03-config.md). It resolves the project root the same way the orchestrate
+// startup does, so `flanders init` from anywhere inside a project writes to that
+// project's .flanders/.
+func runInit(_ []string) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	root, err := paths.FindRoot(cwd)
+	if err != nil {
+		root = cwd // not inside a project yet: init the current directory
+	}
+	return initAt(root, os.Stdout)
+}
+
+// initAt writes the default config under root's .flanders/ and reports the
+// outcome to w. It is factored out of runInit so tests can drive it against a
+// temp directory without changing the process working directory.
+func initAt(root string, w io.Writer) error {
+	p, err := paths.New(root)
+	if err != nil {
+		return err
+	}
+	if err := p.EnsureFlanders(); err != nil {
+		return err
+	}
+	wrote, err := config.WriteDefault(p.Config)
+	if err != nil {
+		return err
+	}
+	if wrote {
+		fmt.Fprintf(w, "flanders: wrote default config to %s\n", p.Config)
+	} else {
+		fmt.Fprintf(w, "flanders: config already exists at %s (not overwriting)\n", p.Config)
+	}
+	return nil
+}
+
+// runOrchestrate is the bare-`flanders` startup: locate the project root, ensure
+// the .flanders/ working directory, start the file-backed logger, then load the
+// run-state cache and journal. The orchestrate loop itself (plan→build) lands in
+// Phase 5.
+func runOrchestrate() error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
