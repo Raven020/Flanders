@@ -640,10 +640,25 @@ func TestIterateNonRepoNoGitSignal(t *testing.T) {
 	}
 }
 
-// TestComposePromptInjectsTaskFileVerbatim: the prompt embeds the task file
-// (frontmatter + body) so the agent sees its acceptance criterion and deps, plus
-// the one-line plan summary — and nothing about unrelated tasks' bodies.
-func TestComposePromptInjectsTaskFileVerbatim(t *testing.T) {
+// newComposeDriver builds a Driver over a temp project so the compose tests can call
+// the method form of composePrompt (which resolves spec references against
+// d.paths.Root). It returns the driver and the project root for tests that write
+// referenced spec files.
+func newComposeDriver(t *testing.T) (*Driver, string) {
+	t.Helper()
+	cfg, p, jr := setupProject(t)
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return d, p.Root
+}
+
+// TestComposePromptInjectsTaskFileAndSummary: the prompt embeds the current task file
+// (frontmatter + body) so the agent sees its acceptance criterion and deps, plus the
+// one-line plan summary.
+func TestComposePromptInjectsTaskFileAndSummary(t *testing.T) {
+	d, _ := newComposeDriver(t)
 	store, err := task.NewStore([]*task.Task{
 		mkTask("0001", task.StatusDone, nil),
 		mkTask("0007", task.StatusPending, []string{"0001"}),
@@ -651,17 +666,153 @@ func TestComposePromptInjectsTaskFileVerbatim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	target := store.ByID("0007")
-	prompt, err := composePrompt(target, store)
+	prompt, err := d.composePrompt(store.ByID("0007"), store)
 	if err != nil {
 		t.Fatalf("composePrompt: %v", err)
 	}
-	for _, want := range []string{"Current task: 0007", "acceptance:", "go test ./... passes for 0007", "1/2 tasks done"} {
+	for _, want := range []string{"Current task: 0007", "acceptance:", "go test ./... passes for 0007", "## Task 0007", "1/2 tasks done"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt missing %q:\n%s", want, prompt)
 		}
 	}
-	if strings.Contains(prompt, "Task 0001") {
-		t.Errorf("prompt leaked an unrelated task's body:\n%s", prompt)
+}
+
+// TestComposePromptIncludesDependencyOutcomes: a dependency's OUTCOME (its id, status,
+// and acceptance criterion it met) is injected so the loop builds on it — but only the
+// summary, never the dependency's full body (that would defeat the cost lever).
+func TestComposePromptIncludesDependencyOutcomes(t *testing.T) {
+	d, _ := newComposeDriver(t)
+	store, err := task.NewStore([]*task.Task{
+		mkTask("0001", task.StatusDone, nil),
+		mkTask("0007", task.StatusPending, []string{"0001"}),
+	})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	prompt, err := d.composePrompt(store.ByID("0007"), store)
+	if err != nil {
+		t.Fatalf("composePrompt: %v", err)
+	}
+	for _, want := range []string{"## Dependency outcomes", "**0001** (done)", "go test ./... passes for 0001"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing dependency outcome %q:\n%s", want, prompt)
+		}
+	}
+	// The dep's BODY heading must not leak — only its frontmatter-derived summary.
+	if strings.Contains(prompt, "## Task 0001") {
+		t.Errorf("prompt leaked the dependency's body, not just its summary:\n%s", prompt)
+	}
+}
+
+// TestComposePromptExcludesUnrelatedTasks: a task that is neither the current task nor
+// one of its dependencies contributes nothing to the prompt — the core cost lever
+// (spec 01: never the whole plan). Here 0002 is unrelated to the current 0007.
+func TestComposePromptExcludesUnrelatedTasks(t *testing.T) {
+	d, _ := newComposeDriver(t)
+	store, err := task.NewStore([]*task.Task{
+		mkTask("0001", task.StatusDone, nil),
+		mkTask("0002", task.StatusDone, nil), // unrelated: not a dep of 0007
+		mkTask("0007", task.StatusPending, []string{"0001"}),
+	})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	prompt, err := d.composePrompt(store.ByID("0007"), store)
+	if err != nil {
+		t.Fatalf("composePrompt: %v", err)
+	}
+	for _, leak := range []string{"go test ./... passes for 0002", "## Task 0002", "**0002**"} {
+		if strings.Contains(prompt, leak) {
+			t.Errorf("prompt leaked unrelated task content %q:\n%s", leak, prompt)
+		}
+	}
+}
+
+// TestComposePromptInjectsReferencedSpecExcerpts: the prompt includes ONLY the spec
+// section a task names via `specs/x.md §Section` (spec 01: "only the named spec
+// excerpts the task references") — the referenced section's content is present and an
+// unreferenced sibling section is excluded.
+func TestComposePromptInjectsReferencedSpecExcerpts(t *testing.T) {
+	d, root := newComposeDriver(t)
+	specPath := filepath.Join(root, "specs", "sample.md")
+	specBody := "# Sample spec\n\n" +
+		"## Wanted section\n\nThis is the WANTED content the task references.\n\n" +
+		"### Wanted detail\n\nNested detail still inside Wanted.\n\n" +
+		"## Other section\n\nThis UNWANTED content must not appear.\n"
+	if err := os.WriteFile(specPath, []byte(specBody), 0o644); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+
+	body := "## Do the work\n\nReferences: specs/sample.md §Wanted section.\n"
+	target := task.New("0001", task.StatusPending, nil, "acceptance for 0001", body)
+	store, err := task.NewStore([]*task.Task{target})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	prompt, err := d.composePrompt(store.ByID("0001"), store)
+	if err != nil {
+		t.Fatalf("composePrompt: %v", err)
+	}
+	for _, want := range []string{"## Referenced spec excerpts", "## Wanted section", "WANTED content", "Nested detail still inside Wanted"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing referenced excerpt %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "UNWANTED") || strings.Contains(prompt, "Other section") {
+		t.Errorf("prompt leaked an unreferenced spec section:\n%s", prompt)
+	}
+}
+
+// TestExtractSection locks the subtle parts of section extraction: a heading inside a
+// fenced code block is not a boundary, a parenthetical heading is matched by its bare
+// name (the prefix rule), and the section runs to the next same-or-higher heading.
+func TestExtractSection(t *testing.T) {
+	const md = "# Title\n\n" +
+		"## Prompt composition (the cost/quality lever)\n\n" +
+		"Body line.\n\n" +
+		"```sh\n# not a heading\n## also not a heading\n```\n\n" +
+		"More body.\n\n" +
+		"### Subsection\n\nstill inside.\n\n" +
+		"## Next section\n\nexcluded.\n"
+
+	got, ok := extractSection(md, "Prompt composition")
+	if !ok {
+		t.Fatal("extractSection: section not found by bare name")
+	}
+	for _, want := range []string{"Prompt composition (the cost/quality lever)", "Body line.", "# not a heading", "More body.", "### Subsection", "still inside."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("excerpt missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Next section") || strings.Contains(got, "excluded.") {
+		t.Errorf("excerpt ran past its boundary:\n%s", got)
+	}
+
+	if _, ok := extractSection(md, "Nonexistent"); ok {
+		t.Error("extractSection matched a nonexistent section")
+	}
+}
+
+// TestComposePromptSkipsUnresolvableSpecRefs: a reference to a missing file or a
+// missing section is a spec-authoring slip, not a harness fault — it is silently
+// skipped (no excerpt section emitted) and composition still succeeds.
+func TestComposePromptSkipsUnresolvableSpecRefs(t *testing.T) {
+	d, root := newComposeDriver(t)
+	// A real file, but the referenced section does not exist in it.
+	if err := os.WriteFile(filepath.Join(root, "specs", "real.md"), []byte("# Real\n\n## Present\n\nhi\n"), 0o644); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	body := "References: specs/missing.md §Whatever and specs/real.md §Absent section.\n"
+	target := task.New("0001", task.StatusPending, nil, "acceptance", body)
+	store, err := task.NewStore([]*task.Task{target})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	prompt, err := d.composePrompt(store.ByID("0001"), store)
+	if err != nil {
+		t.Fatalf("composePrompt: %v", err)
+	}
+	if strings.Contains(prompt, "## Referenced spec excerpts") {
+		t.Errorf("expected no excerpt section for unresolvable refs:\n%s", prompt)
 	}
 }

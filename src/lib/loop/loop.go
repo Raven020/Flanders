@@ -40,11 +40,12 @@
 // done-detection (plan task 3.7). What this package still defers (each its own
 // plan item, wired into the same Iterate spine when it lands): git checkpointing
 // (3.6) and the context/stall/usage guardrails (3.8–3.12). The prompt composition
-// here is the minimal version (the
-// task file + a one-line plan summary); the richer composition (dependency
-// outcomes, named spec excerpts) is plan task 3.2. None of these are stubbed —
-// they are simply not yet steps of the iteration; the driver returns the
-// observation and selected task so the orchestrator has what the later steps need.
+// (compose.go) is the full cost/quality lever (plan task 3.2): the current task file
+// + the outcomes of its dependencies + only the spec excerpts it references + a
+// one-line plan summary, with the loop rules appended as a system prompt. None of
+// the deferred items are stubbed — they are simply not yet steps of the iteration;
+// the driver returns the observation and selected task so the orchestrator has what
+// the later steps need.
 package loop
 
 import (
@@ -206,9 +207,10 @@ func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
 		return &Result{Phase: phase, NoWork: true, AllDone: store.AllDone()}, nil
 	}
 
-	// 2. COMPOSE — the prompt body for this task, plus the loop rules appended as a
-	// system prompt. Rules are optional until plan task 3.3 authors them.
-	prompt, err := composePrompt(t, store)
+	// 2. COMPOSE — the prompt body for this task (task file + dependency outcomes +
+	// referenced spec excerpts + one-line plan summary), plus the loop rules appended
+	// as a system prompt. Rules are optional until plan task 3.3 authors them.
+	prompt, err := d.composePrompt(t, store)
 	if err != nil {
 		return nil, fmt.Errorf("loop: compose prompt for task %s: %w", t.ID(), err)
 	}
