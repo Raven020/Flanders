@@ -5,7 +5,9 @@
 //  2. compose — build the prompt for that task (+ loop rules via system prompt)
 //  3. spawn   — invoke a fresh `claude -p` session and supervise it
 //  4. observe — fold the stream-json into a LoopObservation, classify the outcome
-//     (+ archive the raw transcript and a summary to the journal)
+//  5. verify  — run the harness-owned ground-truth test gate (spec 01 §verify)
+//     (+ archive the raw transcript and a summary, incl. the test result, to the
+//     journal)
 //
 // Why a driver that runs exactly one iteration, not a loop. Ralph's defining rule
 // is "fresh context every iteration; durable state on disk" (spec 01 §Principle).
@@ -29,8 +31,13 @@
 // verify/reconcile step (plan task 3.5) owns the inference fallback and the
 // harness-writes-status-on-kill path.
 //
-// What this package deliberately defers (each is its own plan item, wired into the
-// same Iterate spine when it lands): the test gate / verify step (3.4), status
+// The verify step (5) runs the harness-owned test gate (src/lib/verify) — the
+// ground truth for "done" (spec 01 §done-detection: the canonical test command's
+// exit code, not the agent's self-report). It runs only for the code-producing
+// phases (build/test) on a cleanly-completed invocation, and its test result is
+// recorded in the journal and surfaced on Result for the orchestrator's
+// done-detection (plan task 3.7). What this package still defers (each its own
+// plan item, wired into the same Iterate spine when it lands): status
 // reconciliation (3.5), git checkpointing (3.6), and the context/stall/usage
 // guardrails (3.8–3.12). The prompt composition here is the minimal version (the
 // task file + a one-line plan summary); the richer composition (dependency
@@ -57,6 +64,7 @@ import (
 	"flanders/src/lib/stream"
 	"flanders/src/lib/supervise"
 	"flanders/src/lib/task"
+	"flanders/src/lib/verify"
 )
 
 // Driver runs single Ralph iterations against a project. It is constructed once
@@ -140,6 +148,13 @@ type Result struct {
 	TimedOut    bool                    // the iteration hit [guardrails].iteration_timeout
 	JournalSeq  int                     // the journal entry written this loop (0 when NoWork)
 	Duration    time.Duration           // wall-clock for the whole iteration
+
+	// Verify is the ground-truth test-gate verdict (spec 01 §verify). It is nil
+	// when the gate did not run this loop — a non-code phase (plan/split/discuss),
+	// or an invocation that did not complete cleanly (a usage limit, error, or
+	// timeout): in those cases there is nothing meaningful to test. When non-nil,
+	// Verify.Passed() is the harness-owned "done" signal done-detection (3.7) reads.
+	Verify *verify.Result
 }
 
 // Iterate runs one Ralph loop in the given phase (build|plan|test|split — the
@@ -221,8 +236,27 @@ func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
 	}
 	outcome := obs.Classify(res.ExitCode)
 
+	// 5. VERIFY — the harness-owned ground-truth test gate (spec 01 §verify): run
+	// the configured test command (+ optional build/lint) and trust its exit code,
+	// not the agent's self-report. Gated to the code-producing phases on a clean
+	// invocation (see runsTestGate); on every other loop vr stays nil and the
+	// journal records Test.Ran=false ("not verified this loop").
+	var vr *verify.Result
+	if d.runsTestGate(phase, outcome) {
+		r := verify.Run(ctx, d.paths.Root, d.cfg.Commands)
+		vr = &r
+		if !vr.Test.Ran {
+			d.log.Debug("test gate skipped: no [commands].test configured", "phase", phase)
+		} else if vr.Passed() {
+			d.log.Info("test gate passed", "phase", phase, "task", t.ID(), "exit", vr.Test.ExitCode)
+		} else {
+			d.log.Warn("test gate failed", "phase", phase, "task", t.ID(),
+				"exit", vr.Test.ExitCode, "err", vr.Test.Err, "output_tail", vr.Test.Output)
+		}
+	}
+
 	class, _ := d.cfg.PhaseClass(phase) // phase already validated by invoke.Build above
-	sum := d.buildSummary(phase, t, sid, class, res, obs, start, outcome)
+	sum := d.buildSummary(phase, t, sid, class, res, obs, start, outcome, vr)
 	seq, err := d.journal.Append(sum, &raw)
 	if err != nil {
 		return nil, fmt.Errorf("loop: journal task %s: %w", t.ID(), err)
@@ -232,7 +266,7 @@ func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
 		"phase", phase, "task", t.ID(), "session", sid,
 		"outcome", outcome.String(), "exit", res.ExitCode,
 		"timed_out", res.TimedOut, "journal_seq", seq,
-		"status_after", sum.StatusAfter, "cost_usd", obs.Cost)
+		"status_after", sum.StatusAfter, "test_passed", sum.Test.Passed(), "cost_usd", obs.Cost)
 
 	return &Result{
 		Phase:       phase,
@@ -244,7 +278,21 @@ func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
 		TimedOut:    res.TimedOut,
 		JournalSeq:  seq,
 		Duration:    d.now().Sub(start),
+		Verify:      vr,
 	}, nil
+}
+
+// runsTestGate reports whether the verify step (spec 01 §verify) should run this
+// loop. The test gate is meaningful only for the code-producing phases — build and
+// the TDD test phase — whose ground truth is the test command; plan/split/discuss
+// produce specs or task files, not code, and are judged by plan-completeness (plan
+// task 4.3), so running the test suite after them is wasteful and misleading. It
+// also runs only on a clean invocation (OutcomeSuccess): when the loop ended in a
+// usage limit, an error, or a timeout, the agent did not finish its work, so a
+// verdict on the half-done tree would just confuse done-detection and the stall
+// counter — the orchestrator's guardrails handle those non-success outcomes.
+func (d *Driver) runsTestGate(phase string, outcome stream.Outcome) bool {
+	return outcome == stream.OutcomeSuccess && (phase == "build" || phase == "test")
 }
 
 // readRules returns the loop-rules text appended to the agent's system prompt

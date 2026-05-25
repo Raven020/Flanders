@@ -11,6 +11,7 @@ import (
 	"flanders/src/lib/stream"
 	"flanders/src/lib/supervise"
 	"flanders/src/lib/task"
+	"flanders/src/lib/verify"
 )
 
 // composePrompt builds the prompt body for one task's loop. This is the MINIMAL
@@ -85,6 +86,7 @@ func (d *Driver) buildSummary(
 	obs *stream.LoopObservation,
 	start time.Time,
 	outcome stream.Outcome,
+	vr *verify.Result,
 ) *journal.Summary {
 	// Prefer the CLI's own reported duration (result.duration_ms) when present; fall
 	// back to the harness wall-clock (e.g. a killed loop never reports a duration).
@@ -112,10 +114,18 @@ func (d *Driver) buildSummary(
 		// StatusBefore is the status at selection — always `pending`, since Next only
 		// returns pending tasks (spec 01 §select). Recorded for an honest transition.
 		StatusBefore: t.Status(),
-		// Test is left zero (Ran=false): the harness-owned test gate is the verify
-		// step (plan task 3.4), which this driver does not yet run. Ran=false honestly
-		// says "tests were not run this loop" rather than implying a pass/fail.
-		Test: journal.TestResult{},
+	}
+
+	// Test records the ground-truth gate verdict (spec 01 §journal: "test result").
+	// vr is nil when the verify step did not run this loop (a non-code phase, or a
+	// non-clean invocation — see runsTestGate); the zero TestResult then honestly
+	// reports Ran=false ("not verified this loop") rather than implying a pass/fail.
+	if vr != nil {
+		sum.Test = journal.TestResult{
+			Command:  vr.Test.Command,
+			Ran:      vr.Test.Ran,
+			ExitCode: vr.Test.ExitCode,
+		}
 	}
 
 	for _, sa := range obs.Subagents {

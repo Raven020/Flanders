@@ -324,6 +324,133 @@ func TestIterateRealSupervisorArchivesStream(t *testing.T) {
 	}
 }
 
+// stubSuccess is a d.run that emits a minimal success transcript and returns a
+// clean (OutcomeSuccess) observation — the common case for the gate tests below.
+func stubSuccess(_ context.Context, spec supervise.Spec) (*supervise.Result, error) {
+	if spec.RawSink != nil {
+		_, _ = spec.RawSink.Write([]byte(`{"type":"result","subtype":"success"}` + "\n"))
+	}
+	return &supervise.Result{
+		Observation: &stream.LoopObservation{Done: true, Subtype: "success"},
+		ExitCode:    0,
+	}, nil
+}
+
+// TestIterateTestGatePasses is the task-3.4 acceptance: after a clean build loop the
+// harness runs the configured test command and trusts its exit code. With `exit 0`
+// the gate passes — surfaced on Result.Verify and recorded in the journal.
+func TestIterateTestGatePasses(t *testing.T) {
+	cfg, p, jr := setupProject(t, mkTask("0001", task.StatusPending, nil))
+	cfg.Commands.Test = "exit 0"
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.run = stubSuccess
+
+	res, err := d.Iterate(context.Background(), "build")
+	if err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	if res.Verify == nil || !res.Verify.Passed() {
+		t.Fatalf("Verify = %+v, want a passing gate", res.Verify)
+	}
+	sum, err := jr.Read(res.JournalSeq)
+	if err != nil {
+		t.Fatalf("journal.Read: %v", err)
+	}
+	if !sum.Test.Ran || sum.Test.ExitCode != 0 || !sum.Test.Passed() {
+		t.Errorf("journal Test = %+v, want Ran=true ExitCode=0 (passed)", sum.Test)
+	}
+	if sum.Test.Command != "exit 0" {
+		t.Errorf("journal Test.Command = %q, want %q", sum.Test.Command, "exit 0")
+	}
+}
+
+// TestIterateTestGateFails: a non-zero test exit is the ground-truth "not done"
+// signal — the gate reflects the REAL exit code (the headline 3.4 acceptance),
+// independent of the agent's success self-report.
+func TestIterateTestGateFails(t *testing.T) {
+	cfg, p, jr := setupProject(t, mkTask("0001", task.StatusPending, nil))
+	cfg.Commands.Test = "exit 5"
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.run = stubSuccess // agent reports success…
+
+	res, err := d.Iterate(context.Background(), "build")
+	if err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	if res.Verify == nil || res.Verify.Passed() {
+		t.Fatalf("Verify = %+v, want a FAILING gate despite agent success", res.Verify)
+	}
+	sum, err := jr.Read(res.JournalSeq)
+	if err != nil {
+		t.Fatalf("journal.Read: %v", err)
+	}
+	if !sum.Test.Ran || sum.Test.ExitCode != 5 || sum.Test.Passed() {
+		t.Errorf("journal Test = %+v, want Ran=true ExitCode=5 (not passed)", sum.Test)
+	}
+}
+
+// TestIteratePlanPhaseSkipsGate: the test gate is for code-producing phases only.
+// A plan loop never runs the test command — even one configured to fail — so its
+// completion is judged elsewhere (plan-completeness), and the journal honestly
+// records Test.Ran=false.
+func TestIteratePlanPhaseSkipsGate(t *testing.T) {
+	cfg, p, jr := setupProject(t, mkTask("0001", task.StatusPending, nil))
+	cfg.Commands.Test = "exit 1" // would fail the gate if it ran
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.run = stubSuccess
+
+	res, err := d.Iterate(context.Background(), "plan")
+	if err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	if res.Verify != nil {
+		t.Errorf("Verify = %+v, want nil (plan phase does not run the test gate)", res.Verify)
+	}
+	sum, err := jr.Read(res.JournalSeq)
+	if err != nil {
+		t.Fatalf("journal.Read: %v", err)
+	}
+	if sum.Test.Ran {
+		t.Errorf("journal Test.Ran = true, want false (gate skipped for plan phase)")
+	}
+}
+
+// TestIterateNonSuccessSkipsGate: when the invocation itself did not complete
+// cleanly (here an error result), the gate is skipped — there is no point verifying
+// a half-done tree, and the orchestrator's guardrails handle the non-success path.
+func TestIterateNonSuccessSkipsGate(t *testing.T) {
+	cfg, p, jr := setupProject(t, mkTask("0001", task.StatusPending, nil))
+	cfg.Commands.Test = "exit 0" // would PASS if it ran — proves the skip is outcome-driven
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.run = func(_ context.Context, _ supervise.Spec) (*supervise.Result, error) {
+		// Non-zero exit with no usage-limit signal → OutcomeError.
+		return &supervise.Result{Observation: &stream.LoopObservation{IsError: true}, ExitCode: 1}, nil
+	}
+
+	res, err := d.Iterate(context.Background(), "build")
+	if err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	if res.Outcome != stream.OutcomeError {
+		t.Fatalf("Outcome = %v, want error (precondition for this test)", res.Outcome)
+	}
+	if res.Verify != nil {
+		t.Errorf("Verify = %+v, want nil (gate skipped on a non-success invocation)", res.Verify)
+	}
+}
+
 // TestComposePromptInjectsTaskFileVerbatim: the prompt embeds the task file
 // (frontmatter + body) so the agent sees its acceptance criterion and deps, plus
 // the one-line plan summary — and nothing about unrelated tasks' bodies.
