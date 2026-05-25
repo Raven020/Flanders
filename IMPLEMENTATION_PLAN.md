@@ -58,7 +58,9 @@
 >
 > **PROGRESS (2026-05-26):** **0.5 DONE** — config is now loaded at startup and the `[paths]`/`rules_file` overlay applies via `paths.NewFromConfig` (`runOrchestrate` loads `.flanders/config.toml`, missing → defaults, invalid → hard error). Log level left non-configurable pending a `[logging]` spec section. `Version` `0.0.13`, tag `0.0.13`.
 >
-> **Next up, in priority order:** (1) **Phase 3.1 iteration driver** — now unblocked by the supervisor (2.5), and paths now resolve through config so consumers won't bake in wrong locations.
+> **PROGRESS (2026-05-26):** **3.1 iteration driver DONE** (NEW package `src/lib/loop`). `loop.Driver.Iterate(ctx, phase) (*Result, error)` runs steps 1–4 of the 8-step anatomy as a fresh-context pass: **select** (`task.LoadDir` rebuilds the store from disk at the TOP of every iteration — the audit's required store hot-reload, so an in-loop split is visible to the very next loop), **compose** (minimal: the task file verbatim + a one-line plan done/left summary; the richer dep-outcome/spec-excerpt composition stays 3.2), **spawn** (`invoke.Build` + `supervise.Run`, fresh `--session-id` per loop, `[guardrails].iteration_timeout` + `stream_input` wired through), **observe** (fold `LoopObservation`, `Classify(exitCode)`, then `journal.Append` a Summary + the verbatim transcript captured via `supervise.Spec.RawSink`). Returns a rich `Result{Phase,Task,NoWork,AllDone,SessionID,Observation,Outcome,ExitCode,TimedOut,JournalSeq,Duration}` so the orchestrator acts without re-deriving. DELIBERATE non-scope (each its own item, slotting into the same Iterate spine): status mutation/reconcile stays the agent's + 3.5's (the driver only READS status before=pending / after=reload-from-disk to record the journal transition — it never writes status); state.json run-state machine (iter/stall/usage/phase) stays the orchestrator's (Phase 5); verify/test-gate (3.4), git checkpoint (3.6), guardrails (3.8–3.12). Testing seams = unexported fields `run`(→`supervise.Run`)/`newSessionID`/`now`, swapped in same-package tests; 7 tests incl. one that runs the REAL supervisor over a `cat <fixture>` stub (no live `claude`, per 2.5) to exercise RawSink→journal + the fold end-to-end. NOT yet wired into `main.go runOrchestrate` — Phase 5 owns the loop that calls Iterate. `go build/vet/test ./...` green, race-clean. `Version` `0.0.14`, tag `0.0.14`.
+>
+> **Next up, in priority order:** (1) **Phase 3.4 test gate (verify step)** — the harness-owned ground-truth done-gate (`[commands].test` exit 0); it slots into the Iterate spine after observe and unblocks done-detection (3.7) and status reconciliation (3.5). (2) **Phase 3.2 prompt composition** — enrich the minimal composer with dependency outcomes + named spec excerpts. (3) **Phase 3.5 status reconciliation** — agent-status-first, then git-diff + test-gate inference.
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -510,13 +512,14 @@
 
 ## Phase 3 — The Ralph loop engine  `[depends: 1,2; core of the product]`
 
-- [ ] **3.1 Iteration driver** implementing the 8-step anatomy
+- [x] **3.1 Iteration driver** implementing the 8-step anatomy
   select→compose→spawn→observe→verify→evaluate→checkpoint→repeat (`01`).
   *Audit note — store hot-reload (spec 06 §refinement):* the driver MUST
   `task.LoadDir` (rebuild the store from disk) at the **top of each iteration**,
   not once at launch. An in-loop split (an agent writing new task files mid-loop)
   is otherwise invisible until restart. Single source of truth = the files on
   disk, re-read every loop.
+  (DONE in NEW package `src/lib/loop`: `loop.go` = `Driver`/`Options`/`New`/`Result`/`Iterate`/`readRules`; `compose.go` = `composePrompt`/`planSummary`/`buildSummary`/`errorText`; `loop_test.go` = 7 tests. `Iterate` does select (store hot-reload via `task.LoadDir` at the top of EVERY call — the audit requirement above), compose (minimal — task file verbatim + one-line plan summary; 3.2 enriches), spawn (`invoke.Build`+`supervise.Run`, fresh session id, timeout + stream_input from config, raw transcript teed to journal via `RawSink`), observe (`Classify` + `journal.Append`). The driver READS task status before/after (reloading the file post-loop, since the agent edits its own status mid-run per spec 02) for the journal transition record but does NOT write status — reconcile/inference fallback is 3.5. state.json/iter/stall/usage stay the orchestrator's (Phase 5). An infra failure (load/build/spawn) errors; a loop that merely produced an error/limit/timeout RESULT returns normally with `Result.Outcome` set, since that is a routine guardrail-actionable outcome. NOT wired into `main.go` yet — Phase 5 calls Iterate. `Version` 0.0.14, tag 0.0.14.)
 - [ ] **3.2 Prompt composition (cost/quality lever).** Inject only: current task
   file + dependency outcomes + named spec excerpts + one-line done/left summary;
   rules via `--append-system-prompt`. Never the whole plan/journal. *Acceptance:*
