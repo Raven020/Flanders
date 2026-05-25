@@ -137,6 +137,13 @@ type toolResult struct {
 func (o *LoopObservation) fold(ev *Event, results map[string]toolResult) {
 	lead := ev.ParentToolUseID == "" // lead-agent (not a subagent's inner activity)
 
+	// Context occupancy: advance the lead-agent token high-water mark. leadUsage is
+	// the single source of truth for "what counts as lead context" — the live
+	// [Tracker] folds the very same usage, so the two can never disagree.
+	if tok, ok := leadUsage(ev); ok {
+		o.trackPeak(tok)
+	}
+
 	switch ev.Type {
 	case TypeSystem:
 		if o.SessionID == "" && ev.SessionID != "" {
@@ -151,19 +158,9 @@ func (o *LoopObservation) fold(ev *Event, results map[string]toolResult) {
 			}
 		}
 
-	case TypeStreamEvent:
-		if lead && ev.StreamEvent != nil {
-			if u := ev.StreamEvent.LiveUsage(); u != nil {
-				o.trackPeak(u.Total())
-			}
-		}
-
 	case TypeAssistant:
 		if ev.Assistant == nil {
 			return
-		}
-		if lead && ev.Assistant.Usage != nil {
-			o.trackPeak(ev.Assistant.Usage.Total())
 		}
 		for _, b := range ev.Assistant.Content {
 			switch b.Type {
@@ -251,4 +248,36 @@ func (o *LoopObservation) trackPeak(total int) {
 	if total > o.PeakLeadTokens {
 		o.PeakLeadTokens = total
 	}
+}
+
+// leadUsage returns the context-occupancy token total carried by ev, and whether
+// ev is a LEAD-agent event that carries usage at all. It is the one place the
+// harness decides "what counts toward the lead's context window," shared by the
+// post-hoc [LoopObservation.fold] and the live [Tracker] so they cannot drift.
+//
+// Two rules from specs/08:
+//   - Lead-only: subagent inner events (non-empty parent_tool_use_id) carry usage
+//     for their OWN context and are excluded — a subagent must not inflate the
+//     lead's pressure %.
+//   - Most-complete usage wins: a stream_event prefers message_delta's cumulative
+//     usage over message_start's (via StreamEvent.LiveUsage); an assistant message
+//     carries the assembled turn's usage. Total() over-counts cache categories on
+//     purpose, so the pressure guardrail trips early rather than late.
+func leadUsage(ev *Event) (int, bool) {
+	if ev.ParentToolUseID != "" {
+		return 0, false
+	}
+	switch ev.Type {
+	case TypeStreamEvent:
+		if ev.StreamEvent != nil {
+			if u := ev.StreamEvent.LiveUsage(); u != nil {
+				return u.Total(), true
+			}
+		}
+	case TypeAssistant:
+		if ev.Assistant != nil && ev.Assistant.Usage != nil {
+			return ev.Assistant.Usage.Total(), true
+		}
+	}
+	return 0, false
 }

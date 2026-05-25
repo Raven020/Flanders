@@ -1,7 +1,8 @@
 # Flanders — Implementation Plan
 
 > **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 COMPLETE — all of
-> 1.1–1.6 done. Phase 2.1 COMPLETE — stream-json parser. Go module (`module
+> 1.1–1.6 done. Phase 2.1 COMPLETE — stream-json parser. Phase 2.2 COMPLETE —
+> live context-occupancy tracker. Go module (`module
 > flanders`, go 1.24), layout (`src/cmd/flanders` + `src/lib/{paths,logging,
 > config,task,state,journal,stream}`), file-backed slog logger, paths helper,
 > config loader + default-file writer, the task-file model, the task
@@ -9,13 +10,15 @@
 > load), the journal (`src/lib/journal`, wired into `main` after state load), and
 > the stream-json parser (`src/lib/stream`, typed events + `LoopObservation`
 > aggregator, fixture-based tests against real captured `claude 2.1.150`
-> transcripts) all exist with passing tests. `src/cmd/flanders/main.go` now has a
+> transcripts), and the live context-occupancy `Tracker`
+> (`src/lib/stream/tracker.go`: lead-only, monotonic high-water mark, soft/hard
+> trips) all exist with passing tests. `src/cmd/flanders/main.go` now has a
 > real dispatcher: `init` → writes a commented default config; bare `flanders` →
 > orchestrate startup; `discuss|plan|build` → honest "not implemented yet" error;
 > unknown → usage error (stdlib only, no CLI framework). `Version` const is
-> `0.0.8`; tag `0.0.8` will be created. `go build ./...`, `go vet ./...`, and
-> `go test ./...` are all green. **Next up: Phase 2.2 (Live token /
-> context-occupancy tracker)**.
+> `0.0.9`; tag `0.0.9` will be created. `go build ./...`, `go vet ./...`, and
+> `go test ./...` are all green. **Next up: Phase 2.3 (Usage-limit
+> detection + reset parse)**.
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -293,10 +296,34 @@
   `Agent` in 2.1.150 (parser accepts `Agent` OR `Task`); `parent_tool_use_id`
   attributes nested subagent activity. spec 08 has been updated from
   draft→PINNED. 9 tests, full suite + build + vet green.)
-- [ ] **2.2 Live token / context-occupancy tracker.** Fold `message_start` /
+- [x] **2.2 Live token / context-occupancy tracker.** Fold `message_start` /
   `message_delta` usage into a running % of `[context].window_tokens`; expose for
   meters + guardrail. *Acceptance:* synthetic stream drives the % monotonically;
   trips at soft/hard. (`08` §live token tracking, `01` §context-pressure)
+  (Implemented in NEW file `src/lib/stream/tracker.go` (`Tracker` type + `Trip`
+  enum `TripNone|TripSoft|TripHard`) + `tracker_test.go` (6 tests). KEY REFACTOR:
+  extracted `leadUsage(ev) (int,bool)` in `observe.go` as the SINGLE SOURCE OF
+  TRUTH for "what counts as lead context" (lead-only — subagent
+  `parent_tool_use_id` excluded; prefers `message_delta` cumulative usage over
+  `message_start` via `StreamEvent.LiveUsage`; `Usage.Total()` over-counts cache
+  categories so the guardrail trips early). Both the post-hoc `LoopObservation.fold`
+  and the live `Tracker` now fold the SAME `leadUsage`, so they cannot drift —
+  locked by `TestTrackerMatchesObservation` (Tracker peak == obs.PeakLeadTokens
+  over the real `basic.jsonl` fixture). WHY a separate `Tracker` from
+  `LoopObservation`: the observation is the post-hoc summary of a FINISHED loop;
+  the Tracker is the IN-FLIGHT signal the guardrail reacts to mid-loop before any
+  result event exists. Fed event-by-event via the existing `ObserveFunc`
+  per-event hook (the seam — no new plumbing); MONOTONIC by construction (token
+  high-water mark + window only resolves upward, so % and Trip never regress and a
+  tripped tier stays tripped — the safe one-way guardrail decision). `Trip()`
+  maps occupancy→tier at `soft_pct`/`hard_pct` (config `[context]`, defaults
+  0.75/0.90 via `DefaultSoftPct`/`DefaultHardPct`); `SoftTripped()`/`HardTripped()`
+  convenience. `Update` auto-adopts the CLI-reported window from
+  `result.modelUsage.contextWindow` when `window_tokens=0`. Zero-value/no-window
+  Tracker is INERT (`TripNone`, occupancy 0) — guarded so a bare struct can't
+  spuriously hard-trip. NOT yet wired into a live loop (no loop driver until
+  Phase 3); the guardrail CONSUMER is task 3.11, the process-supervisor seam is
+  2.5. `go build/vet/test ./...` all green; `Version` bumped to 0.0.9.)
 - [ ] **2.3 Usage-limit detection + reset parse.** Classify an error `result` /
   non-zero exit as usage-limit vs. genuine error; extract `reset_at` (or fall back
   to `[usage].backoff`). *Acceptance:* known limit payloads → wait+reset; ordinary
@@ -490,12 +517,15 @@
    ANSWERED: the CLI reports `result.modelUsage.<model>.contextWindow` (e.g.
    200000) at result time, surfaced as `LoopObservation.ContextWindow` — so the
    window is available after the first completed loop without any hardcoded table.
-   STILL OPEN: live tracking *before* the first result (during the loop) still
-   needs either the config window or a model→window default — decide in 2.2
-   whether to ship a small static map or require `window_tokens` in config for the
-   live meter. (Loader side ready: `config` accepts `window_tokens = 0` as the
-   "auto-detect" sentinel; `Occupancy(window)` in `src/lib/stream` falls back to
-   the CLI-reported window when config window is 0.)
+   RESOLVED (decided in 2.2): NO static model→window map is shipped. The live
+   meter relies on config `[context].window_tokens` (default 200000) as the seed
+   before the first result, and `stream.Tracker.Update` auto-adopts the
+   CLI-reported window (`result.modelUsage.contextWindow`) at result time to
+   confirm/correct it for subsequent loops. So `window_tokens` is the live seed
+   and the CLI is the source of truth thereafter — no hardcoded table. (Loader
+   side ready: `config` accepts `window_tokens = 0` as the "auto-detect" sentinel;
+   `Occupancy(window)` in `src/lib/stream` falls back to the CLI-reported window
+   when config window is 0.)
 6. **Plan-completeness method is OPEN** (`06`) — agent self-assessment vs. coverage
    check vs. (rejected) user approval. Pick one for task 4.3.
 7. **Stale spec note** — multiple specs say "the harness's own directory is not yet
