@@ -251,7 +251,11 @@ func (o *LoopObservation) fold(ev *Event, results map[string]toolResult) {
 		if ri.RateLimitType != "" {
 			o.RateLimitType = ri.RateLimitType
 		}
-		if t := ri.ResetTime(); !t.IsZero() {
+		// Never regress the reset to an EARLIER epoch: a later rate_limit_event with
+		// a smaller resetsAt would otherwise make the usage-wait guardrail (3.12)
+		// resume before the window has actually reset, immediately re-hitting the
+		// limit. Keep the latest (largest) known reset — the conservative wait. (2.6b)
+		if t := ri.ResetTime(); !t.IsZero() && (o.ResetAt == nil || t.After(*o.ResetAt)) {
 			o.ResetAt = &t
 		}
 		if ri.Limited() {

@@ -1,25 +1,62 @@
 # Flanders — Implementation Plan
 
 > **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 COMPLETE — all of
-> 1.1–1.6 done. Phase 2.1 COMPLETE — stream-json parser. Phase 2.2 COMPLETE —
-> live context-occupancy tracker. Phase 2.3 COMPLETE — usage-limit detection +
-> reset parse. Phase 2.4 COMPLETE — CLI invocation builder (`src/lib/invoke`:
-> pure argv composer + fresh session-id minting). Go module (`module
-> flanders`, go 1.24), layout (`src/cmd/flanders` + `src/lib/{paths,logging,
-> config,task,state,journal,stream,invoke}`), file-backed slog logger, paths helper,
-> config loader + default-file writer, the task-file model, the task
-> store/selector, the state cache (`src/lib/state`, wired into `main` for startup
-> load), the journal (`src/lib/journal`, wired into `main` after state load), and
-> the stream-json parser (`src/lib/stream`, typed events + `LoopObservation`
-> aggregator, fixture-based tests against real captured `claude 2.1.150`
-> transcripts), and the live context-occupancy `Tracker`
-> (`src/lib/stream/tracker.go`: lead-only, monotonic high-water mark, soft/hard
-> trips) all exist with passing tests. `src/cmd/flanders/main.go` now has a
-> real dispatcher: `init` → writes a commented default config; bare `flanders` →
-> orchestrate startup; `discuss|plan|build` → honest "not implemented yet" error;
-> unknown → usage error (stdlib only, no CLI framework). `Version` const is
-> `0.0.11`; tag `0.0.11` will be created. `go build ./...`, `go vet ./...`, and
-> `go test ./...` are all green. **Next up: Phase 2.5 (process supervisor)**.
+> 1.1–1.6 done. Phase 2.1–2.4 COMPLETE — stream-json parser, live
+> context-occupancy tracker, usage-limit detection + reset parse, CLI invocation
+> builder (`src/lib/invoke`). Go module (`module flanders`, go 1.24), layout
+> (`src/cmd/flanders` + `src/lib/{paths,logging,config,task,state,journal,stream,
+> invoke}`), file-backed slog logger, paths helper, config loader + default-file
+> writer, the task-file model, the task store/selector, the state cache, the
+> journal, the stream-json parser (typed events + `LoopObservation` aggregator,
+> fixture tests vs. real `claude 2.1.150`), and the live `Tracker` all exist with
+> passing tests. `src/cmd/flanders/main.go` has a real dispatcher: `init` → writes
+> a commented default config; bare `flanders` → orchestrate startup;
+> `discuss|plan|build` → honest "not implemented yet" error; unknown → usage error.
+> `Version` const is `0.0.11`; tag `0.0.11` exists. `go build/vet/test ./...` all
+> green.
+>
+> **AUDIT (2026-05-25):** a full re-audit of `src/lib/*` against `specs/*` (8
+> parallel agents + Opus synthesis) confirmed every "done" item's spec claims hold,
+> and surfaced a small set of **confirmed corrective gaps** now folded in below —
+> the most important being **0.5** (`[paths]` config is parsed but `paths.New`
+> ignores it → the whole `[paths]` section is a silent no-op; spec-03
+> non-compliance). Phase-3/5/7 items were enriched with scoping clarifications the
+> specs require but the items hadn't yet spelled out (in-loop store hot-reload,
+> stall-counter reset, `max_cycles` accounting, soft-wind-down fallthrough,
+> reconciliation order). New discuss/plan gap items added (3.x notes, 4.3 method,
+> 7.5–7.6). See the expanded **Findings** section.
+>
+> **RE-VERIFY (2026-05-25, independent pass):** a second audit (5 spec-summary
+> agents + 6 code-verification agents over `src/*` vs `specs/*`) re-confirmed,
+> against the actual source, every "done" claim AND every open-gap item below.
+> Build is green: `go build/vet/test ./...` pass with **103 tests, 0 failures, 0
+> skips, no TODO/FIXME/panic/stub markers** anywhere in `src/`. Code-confirmed
+> facts now pinned: **2.5** — zero `os/exec` in the tree, no supervisor exists (top
+> blocker, confirmed); **0.5** — `paths.New` (`paths.go:48-66`) hardcodes the
+> `Default*` constants AND `runOrchestrate` (`main.go:107-165`) **never calls
+> `config.Load` at all**, so paths *and* the log level (hardcoded `slog.LevelInfo`,
+> `main.go:125`) run on defaults regardless of config — the fix is broader than a
+> `[paths]` overlay, it is "load config at startup and resolve everything through
+> it" (folds in finding 15); **2.6** — no outbound encoder, `rate_limit_event`
+> epoch can regress (`observe.go:254-256` unconditional overwrite), 9 spec-08
+> fields RAW-only; **1.7** — no id↔filename check, `keyAttempts` const w/o
+> accessor, `Notes()/Files()` getters but no setters; `[tui]` and `[logging]`
+> config sections both absent (findings 14/15). No new gaps surfaced; no progress
+> has landed since 2.4 (no commits), so the priority order is unchanged.
+>
+> **RE-VERIFY (2026-05-25, third pass @ commit `e79618b`):** a third independent
+> pass (3 parallel code/spec agents) re-confirmed, against the live source, every
+> "done" claim (0.1–0.4, 1.1–1.6, 2.1–2.4 genuinely meet acceptance — no hidden
+> stubs) AND every open gap (0.5, 1.7, 2.5, 2.6, `[tui]`/`[logging]` sections — all
+> still open, none secretly fixed). `go build/vet/test ./...` green; `Version`
+> `0.0.11`, tags `0.0.1`–`0.0.11` present. NOTE: the whole AUDIT/RE-VERIFY block
+> above (and most of the Findings section) is **uncommitted** on `main` — the
+> auto-commit hook tags source but did not commit these plan edits; keep them.
+> **0.5 → Phase 3**.
+>
+> **PROGRESS (2026-05-26):** **2.5 process supervisor DONE** (`src/lib/supervise` — spawn/stream/wait, process-group timeout-kill, stdin injection writer; 12 tests, race-clean) plus **2.6(a)** outbound encoder (`stream.EncodeUserMessage`) and **2.6(b)** reset-epoch regression guard. The Phase-3 loop-engine blocker is cleared. `Version` `0.0.12`, tag `0.0.12`. `go build/vet/test ./...` green.
+>
+> **Next up, in priority order:** (1) **0.5 `[paths]` overlay** — cheap foundational correctness fix; (2) **Phase 3.1 iteration driver** — now unblocked by the supervisor.
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -64,6 +101,29 @@
 - [x] **0.4 Paths helper** in `src/lib`: resolve `[paths]` (specs, tasks, journal,
   plan, state) relative to project root; create `.flanders/` on demand.
   (`src/lib/paths`: New/EnsureFlanders/FindRoot; resolves specs/03 [paths] defaults + rules/config/log; creates `.flanders/` on demand)
+- [ ] **0.5 Load config at startup + apply the `[paths]` overlay** `[CONFIRMED GAP
+  — spec-03 non-compliance; code-verified twice]`. Two coupled facts: (a)
+  `paths.New(root)` (`src/lib/paths/paths.go:48-66`) hardcodes the `Default*`
+  constants and **never consults `config.Paths`**; and (b) — the deeper root cause
+  — `runOrchestrate` (`src/cmd/flanders/main.go:107-165`) **never calls
+  `config.Load` at all** (the `config` import is used only by `initAt`'s
+  `WriteDefault`). So a user's `[paths]` section is parsed+validated by
+  `src/lib/config` and then ignored, AND the log level is hardcoded
+  (`slog.LevelInfo`, `main.go:125`) because no config ever reaches it. Spec 03 says
+  `[paths]` (and the rest) are configurable. *Fix:* (1) in `runOrchestrate`, load
+  `.flanders/config.toml` when present (fall back to `config.Default()` when
+  absent) — this is the single startup config-load every later phase depends on;
+  (2) add a config-aware constructor in `src/lib/paths` (e.g. `NewFromConfig(root,
+  *config.Config)` or `New(root, opts)`) that overlays any non-empty
+  `[paths].{specs,tasks,journal,plan,state}` onto the defaults, keeping the rules/
+  config/log derivations; (3) resolve the logger level from config once loaded
+  (this is the natural home for finding 15 — but it needs a `[logging]` level field
+  added to `src/lib/config`, currently absent; do the field+wiring or leave the
+  level alone and just land paths — decide). **No new package** — consolidate in
+  `src/lib/paths`. *Acceptance:* a config with custom `[paths]` resolves
+  journal/state/tasks to the configured locations; absent keys keep the defaults;
+  startup loads the real config. Do **before** Phase-3 consumers start resolving
+  paths so they never bake in the wrong locations. (Low effort, foundational.)
 
 ## Phase 1 — Config & data model (`src/lib` core)  `[depends: 0]`
 
@@ -246,6 +306,19 @@
   load and logs `entries=<depth>` — the history depth the orchestrator will fold
   into a rebuilt `state.Iter`.
   10 tests + full suite green; `Version` const bumped to 0.0.6.)
+- [ ] **1.7 Task-file model completeness (small gaps from audit).** Three minor
+  spec-derived gaps in `src/lib/task`, none blocking but cheap to close: (a)
+  **`id` ↔ filename-prefix validation** — spec 02 says `id` "matches filename
+  prefix" but `LoadDir` (`store.go`) never checks that `0007-foo.md` carries
+  `id: 0007`; add the check at load (warn or error — decide). (b) **`attempts`
+  accessor/setter** — the `keyAttempts` constant exists (`task.go:69`) and the
+  field round-trips via the yaml.Node, but there is no `Attempts()/SetAttempts()`;
+  the build flow (4.4/4.5) needs to read+increment it for escalation. (c)
+  **`SetNotes`/`SetFiles` setters** — getters exist, setters don't; the loop
+  driver (3.5) and split pass (4.6) will need to write `notes`/`files`.
+  *Acceptance:* id-mismatch surfaced at load; attempts round-trips through the
+  typed API; notes/files writable. (Several sub-parts are spec-OPEN — gate against
+  the consumers in Phase 3/4; do only the parts those consumers need.)
 
 ## Phase 2 — Agent integration & stream-json  `[depends: 1; highest technical risk]`
 
@@ -402,15 +475,45 @@
   config, unrecognized permission_mode. NOT yet wired into a live loop (loop driver
   is Phase 3); CONSUMERS are the supervisor 2.5 and iteration driver 3.1. `go
   build/vet/test ./...` all green. Version 0.0.11; tag 0.0.11.)
-- [ ] **2.5 Process supervisor.** Spawn/stream/wait the CLI; capture stdout(events)
+- [x] **2.5 Process supervisor.** Spawn/stream/wait the CLI; capture stdout(events)
   + stderr; enforce per-iteration timeout (kill); expose a writer for stream-json
   input injection (soft wind-down). *Acceptance:* runs a stub command, streams
   output, times out + kills cleanly.
+  *Audit note — invoke contract:* when `[agent].stream_input=true`, `invoke.Build`
+  deliberately omits the prompt from argv (it must go over stdin) with **no
+  compile-time enforcement** (`invoke.go:117-121`). 2.5 owns that stdin write; make
+  the supervisor's API make "you must write the prompt to stdin" un-missable (e.g.
+  require a prompt-writer when the spec has `stream_input`), so a forgotten write
+  can't send an empty turn.
+  (Implemented in NEW package `src/lib/supervise` (package `supervise`), stdlib only (`os/exec`, `context`, `syscall`, `bufio`/`io`, `sync`) plus `src/lib/invoke` (for `Command`) and `src/lib/stream` (decode/fold). Files: `supervise.go` (`Spec`, `Result`, `Proc`, `Start`, `Run`, `Inject`, `CloseInput`, `Kill`, `Wait`), `proc_unix.go`/`proc_other.go` (build-tagged process-group kill), `supervise_test.go` (12 tests, stub-command based: cat over a stream-json fixture + `sh -c`, no real claude). API: `Run(ctx, Spec)` is the blocking convenience (spawn→stream→wait→Result); `Start` returns a live `*Proc` for the soft-wind-down guardrail (3.11) to `Inject`/`Kill` mid-loop. Folding stays internal via `stream.ObserveFunc` so the stream is decoded exactly once; `Result.Observation`+`Result.ExitCode` are exactly what `LoopObservation.Classify(exitCode)` consumes. KEY DECISIONS: (a) UN-MISSABLE STDIN CONTRACT — `Start` errors if `StreamInput && Prompt==""` and OWNS the initial prompt write to stdin, so invoke.Build dropping the prompt from argv (no compile-time enforcement) can never become an empty turn (closes the 2.5 audit note). (b) TIMEOUT/KILL via `exec.CommandContext`+`cmd.Cancel`+`cmd.WaitDelay`(5s): timeout creates a `context.WithTimeout` child; on expiry `cmd.Cancel` SIGKILLs the whole PROCESS GROUP (`Setpgid`, kill `-pgid`) so CLI-spawned subprocesses die too; `Result.TimedOut`/`Canceled` distinguish deadline vs parent-cancel (read before releasing the timer so DeadlineExceeded isn't masked). (c) RAW ARCHIVE — `Spec.RawSink` is teed off the SAME read the decoder consumes (`io.TeeReader`), so the journal archive is byte-faithful incl. skipped lines. (d) `Spec.OnEvent func(p *Proc, ev)` receives the `*Proc` (constructed before the read goroutine launches) so a guardrail can drive a `stream.Tracker` AND inject/kill without a closure-ordering race. (e) stderr → bounded 256KiB buffer (drops tail, never blocks the pipe). (f) `Wait` closes stdin FIRST then drains stdout/stderr before `cmd.Wait` (os/exec requires reads complete before Wait; closing stdin first avoids deadlock vs a read-to-EOF child like the `cat` stub). Verified green incl. `go test -race -count=2`. Acceptance MET: runs a stub command, streams output, times out + kills cleanly. NOT yet wired into a live loop (consumer = iteration driver 3.1 + context guardrail 3.11). Version 0.0.12; tag 0.0.12.)
+- [ ] **2.6 Stream-json completeness pass (audit follow-ups).** Non-blocking
+  decoder gaps found in the audit; close opportunistically as their consumers land:
+  (a) **outbound stream-json envelope** — there is NO encoder for messages sent
+  *into* the CLI; the soft-wind-down injection (3.11 tier 2) needs one. This is the
+  one item with a hard downstream dependency (2.5 + 3.11) — do it with them. (b)
+  **`rate_limit_event` epoch regression guard** — `observe.go:254-258` lets a later
+  event with a *smaller* epoch overwrite a good `ResetAt`; keep the
+  earliest/most-trustworthy. (c) **journal data-loss fields** — `ResultEvent` drops
+  `duration_api_ms`/`ttft_ms`; `ModelUsage` drops `webSearchRequests`; the `user`
+  wire's `tool_use_result` sibling (`stdout`/`stderr`/`interrupted`) and
+  `content_block.caller` are kept only in `Raw`. Add the ones the journal/TUI
+  actually render (esp. `tool_use_result` for LIVE-pane `✓/✗`, and `system`
+  `task_started`/`task_progress`/`task_notification` subtypes for the AGENTS tree).
+  (d) **real usage-limit fixture** — all limit tests are synthetic (spec 08 OPEN);
+  capture a real limit transcript when one is available and re-verify `Classify`.
+  *Acceptance:* outbound envelope round-trips; reset epoch never regresses;
+  journal/TUI fields present where consumed.
+  *(2.6a DONE: `stream.EncodeUserMessage(text)` added in NEW `src/lib/stream/encode.go` — the outbound user-turn NDJSON line (`{"type":"user","message":{"role":"user","content":[{"type":"text",...}]}}`) the soft wind-down (3.11) and discuss (7.x) inject; round-trips through the inbound Decoder (test-locked). Wire shape stays spec-08-OPEN/best-effort — re-verify vs a captured input transcript. 2.6b DONE: the `rate_limit_event` epoch regression is fixed in `observe.go` — `ResetAt` now only advances to a LATER epoch, never regresses to an earlier one (conservative usage-wait). REMAINING: 2.6c journal/TUI data-loss fields, 2.6d real usage-limit fixture.)*
 
 ## Phase 3 — The Ralph loop engine  `[depends: 1,2; core of the product]`
 
 - [ ] **3.1 Iteration driver** implementing the 8-step anatomy
   select→compose→spawn→observe→verify→evaluate→checkpoint→repeat (`01`).
+  *Audit note — store hot-reload (spec 06 §refinement):* the driver MUST
+  `task.LoadDir` (rebuild the store from disk) at the **top of each iteration**,
+  not once at launch. An in-loop split (an agent writing new task files mid-loop)
+  is otherwise invisible until restart. Single source of truth = the files on
+  disk, re-read every loop.
 - [ ] **3.2 Prompt composition (cost/quality lever).** Inject only: current task
   file + dependency outcomes + named spec excerpts + one-line done/left summary;
   rules via `--append-system-prompt`. Never the whole plan/journal. *Acceptance:*
@@ -426,6 +529,14 @@
   outcome from `git diff` (work happened?) + test gate; when the harness itself
   ends a loop, **write `status`/`reason` directly**. *Acceptance:* outcome recorded
   whether or not the agent flipped status. (`02` §mutation ownership)
+  *Audit note — reconciliation order (spec 01 OPEN):* make the precedence explicit
+  — **check the agent-written `status` first**, fall back to git-diff + test-gate
+  inference only when the agent left it unchanged. (Whether the agent flips status
+  directly vs. the harness reconciles from a structured verdict is spec-OPEN; the
+  fallback ordering above is the safe default.) This is also the home of the
+  RUNNING-crash git-reconcile path that `state.LoadOrRebuild` defers (spec 09
+  §resume): on resume of a RUNNING state, re-read `git status`/`git diff` to decide
+  whether the interrupted loop actually landed work before continuing.
 - [ ] **3.6 Git checkpointing.** Commit on progress (status change or passing
   tests); `commit_each` modes; `message_tmpl`; offer `git init` if target isn't a
   repo. *Acceptance:* progress commit created with templated message. (`01`, `03`)
@@ -434,6 +545,10 @@
 - [ ] **3.8 Guardrail: max-iterations** per phase → halt + surface. (`01`,`03`)
 - [ ] **3.9 Guardrail: stall** — N consecutive no-file-change *and* no-status-change
   loops → halt. *Acceptance:* halts after `stall_n`. (`01`,`03`)
+  *Audit note:* spell out the **reset** condition — the consecutive counter
+  (`state.stall.count`) resets to 0 on any loop that produces a file change OR a
+  status change; it only halts when it reaches `stall.n`. Test both the increment
+  and the reset.
 - [ ] **3.10 Guardrail: per-iteration timeout** — kill + record. (uses 2.5)
 - [ ] **3.11 Guardrail: context-pressure (three-tier).** (a) proactive agent
   handoff (rule-driven); (b) **soft wind-down ~75%** via injected stream-json
@@ -442,11 +557,23 @@
   all three ways. **Exhausted loop never splits itself.** *Acceptance:* each tier
   leaves a `blocked: context-overreach` task + handoff. (`01` §context-pressure,
   `06` §refinement)
+  *Audit notes:* (1) **fallthrough when `stream_input=false`** — tier 2 (soft
+  wind-down) is only available over the stdin stream-json channel; when it's off,
+  go straight from tier 1 to tier 3 (hard kill) at the hard threshold. Call this
+  path out explicitly. (2) Consumes `stream.Tracker` (`SoftTripped`/`HardTripped`,
+  fed via the `ObserveFunc` per-event hook — seam confirmed) and the **outbound
+  envelope from 2.6** for the injected message.
 - [ ] **3.12 Guardrail: usage-limit wait/auto-resume.** On limit (2.3): set
   `WAITING`, persist `reset_at`, sleep to reset (or `backoff`), auto-resume;
   honor `[usage].on_limit` (wait|halt) and `max_cycles`. State on disk ⇒
   close/reopen resumes. *Acceptance:* simulated limit → wait → resume; `halt` mode
   stops. (`01`, `09`)
+  *Audit note — `max_cycles` accounting:* `state.usage.cycles_used` already exists
+  in the schema; make the increment+cap explicit — bump `cycles_used` on each
+  usage-wait resume and stop (per `on_limit`) when it reaches `[usage].max_cycles`
+  (default unlimited). Use `ResetAt` when present, else `[usage].backoff` (the
+  stream package deliberately leaves the backoff fallback to this consumer — it
+  needs config).
 
 ## Phase 4 — Phases & agent classes  `[depends: 3]`
 
@@ -461,10 +588,21 @@
   maps to ≥1 task (not provably perfect). *Acceptance:* uncovered requirement
   detected; covered plan passes. (`06` §plan-completeness — *judgment method is
   OPEN in spec; pick one*)
+  *Audit note:* this check is the **plan-phase loop-exit condition** (step 6,
+  "evaluate", of the 3.1 anatomy) — wire it as such, don't leave it standalone.
+  Method is spec-OPEN (agent self-assessment vs. a mechanical coverage scan
+  mapping each spec `## `/requirement to ≥1 task ref vs. — rejected — user
+  approval); decide before implementing. Recommend the mechanical coverage scan
+  (cheapest, harness-owned ground truth, parallels the test-gate philosophy).
 - [ ] **4.4 TDD `test` agent loop (always-on).** For each task: ensure a **red**
   acceptance test exists — reuse if red; if a test already **passes** → mark task
   `done`, **skip build**; else write minimal red test. Author ≠ implementer.
   *Acceptance:* the three branches behave as specified. (`07` §test agent)
+  *Audit note — spec-OPEN dependencies:* (1) how the test agent **locates** an
+  existing test for a task (naming convention? filter? agent judgment?) is OPEN in
+  spec 07 — decide before implementing. (2) `tdd=false` escape hatch is OPEN in
+  spec 07 and has **no plan item**; if it's ever wanted, 4.4 needs a conditional
+  bypass — track, don't build for v1.
 - [ ] **4.5 Per-task build flow test→build→verify.** Wire 4.4 → build loop(s) →
   test gate, per task. *Acceptance:* a task drives red→green→verified. (`07`,`06`)
 - [ ] **4.6 Split pass (fresh).** Tiny fresh agent: given a
@@ -479,6 +617,12 @@
   single focused plan loop resolve the blocks; then resume build. At most one
   phase switch per drain boundary. *Acceptance:* a planted gap drains → one
   re-plan → resumes, not per-gap bouncing. (`06`)
+  *Audit note — iteration-budget apportionment (spec 06 OPEN):* `[guardrails]
+  .max_iterations` is a single config value, but plan loops and build loops both
+  consume iterations. Decide whether the cap is per-phase or global (and how it's
+  split) so a runaway plan loop can't exhaust the whole budget before build starts.
+  `state.iter` already tracks `{plan,build,total}` separately — use those. Affects
+  3.8 (the max-iter guardrail reads whichever scope is chosen).
 - [ ] **5.2 Full autonomy after launch** — no per-cycle approval; pause only on
   guardrail halt or usage wait. *Acceptance:* pipeline runs plan→build→done with
   no human gate. (`06`,`05`)
@@ -491,6 +635,11 @@
 - [ ] **6.1 Bubble Tea infra.** Harness emits events/state on a channel → BT
   messages (Elm model/update/view); handle resize; truecolor Lipgloss palette +
   semantic roles (`04-tui.md` table) with `[tui].theme` overrides (OPEN keys).
+  *Audit note — config prerequisite:* the `Config` struct has **no `[tui]`
+  section** today (confirmed in `src/lib/config/config.go`). Add a `TUI`/`Theme`
+  section (per-role override keys are spec-OPEN — define them here) to
+  `src/lib/config` before 6.1 can honor `[tui].theme`. Small, but a hard
+  prerequisite.
 - [ ] **6.2 Header bar** — app · phase · **persistent `⚠ PERMISSIONS BYPASSED`**
   (red, bold/inverse, never dimmed — LOCKED req from `03`) · `iter n/max` · run
   state (RUNNING|PAUSED|WAITING|HALTED|DONE).
@@ -515,6 +664,10 @@
   `specs/tasks/*.md` (nested `- [ ]/- [x]`), never hand-edited. *(This is the
   generator that supersedes the bootstrap nature of this file — see meta-note.)*
   (`02` §derived checklist)
+  *Audit note — sequencing:* this has **no Bubble Tea dependency** (it's a pure
+  task-files → markdown renderer, spec 02 infrastructure). It is filed under
+  Phase 6 but could land as early as Phase 4 (once 4.2 produces task files),
+  giving a useful artifact much sooner. Consider pulling it forward.
 - [ ] **6.13 `--no-tui` / non-TTY headless** mode: structured progress lines from
   the same event stream (auto when stdout isn't a TTY). (`04`; log format OPEN)
 
@@ -533,6 +686,33 @@
   exit. Reuses palette/infra. (`05`)
 - [ ] **7.4 Handoff** — discuss never auto-runs plan; on exit may *suggest* "run
   `flanders plan`"; running it is the human's only control point. (`05`,`06`)
+  *Audit note:* pin down the `p` key's exact behavior (spec 05 says it "triggers"
+  plan; 7.4 says "suggest") — recommend: `p` exits discuss and launches
+  `flanders plan` (the human pressing it IS the control point), distinct from the
+  passive on-exit text suggestion.
+- [ ] **7.5 Discuss agent system prompt + `specs/`-scope enforcement** `[AUDIT GAP
+  — no prior plan item]`. Spec 05 requires (a) a discuss-specific **system/role
+  prompt** (drive to decisions, surface trade-offs, ask focused questions, write
+  decisions to disk *as made*; maintain spec house-style; **user owns
+  granularity** — propose, don't impose detail) — the discuss analogue of the 3.3
+  loop rules file, which currently has no item; and (b) **technical enforcement
+  that Write/Edit is scoped to `specs/`** plus read-only exploration of the target
+  codebase, under `bypassPermissions`. Today the only scoping mechanism in the
+  design is prompt rules — decide whether prompt-level scoping suffices or a real
+  guard is needed. (`config.PhaseClass("discuss")` already resolves opus/high — the
+  model side is done.) *Acceptance:* discuss agent boots with its role prompt and
+  cannot write outside `specs/`.
+- [ ] **7.6 Discuss session lifecycle + spec-OPEN behaviors** `[AUDIT GAP]`.
+  (a) **Long-lived per-turn loop** — discuss is the ONLY non-Ralph mode: it keeps
+  one `claude` session and injects each user turn over stdin stream-json (no fresh
+  session per turn). Model this explicitly (it's the opposite of the loop engine's
+  fresh-context-every-iteration). (b) **Context-exhaustion behavior** — the Ralph
+  context guardrails (3.11) are loop-specific and don't apply; spec 05 leaves
+  discuss-window overflow undefined. Decide (e.g. summarize-and-continue, or warn
+  and require restart). (c) Two spec-05 **OPEN** items with no coverage: a
+  pre-handoff *readiness check* ("no blocking `OPEN`s remain?"), and whether
+  discuss can be **re-entered during a paused build** to amend specs then resume.
+  Track; resolve in a discuss-spec pass before building 7.x.
 
 ## Phase 8 — CLI surface, polish, E2E  `[depends: all]`
 
@@ -606,6 +786,51 @@
    single-screen vs full-screen LIVE (`04`), `--no-tui` log format, `tdd=false`
    escape hatch (`07`), test-command auto-detect (`03`), how the test agent locates
    an existing test (`07`), optional task frontmatter `attempts` (`02`).
+
+### Audit re-run 2026-05-25 — new confirmed findings
+
+9. **`[paths]` config is a silent no-op** `[CONFIRMED, code-verified]`.
+   `paths.New(root)` (`src/lib/paths/paths.go:48-66`) always uses the hardcoded
+   `Default*` constants; nothing overlays `config.Paths` (parsed + validated by
+   `src/lib/config`). A user's `[paths]` section is therefore ignored — spec-03
+   non-compliance. → **task 0.5** (highest-priority correction; cheap).
+10. **Stream decoder drops spec-documented fields** (all non-blocking, → task 2.6):
+    `ResultEvent` lacks `duration_api_ms`/`ttft_ms`; `ModelUsage` lacks
+    `webSearchRequests`; the `user` wire's `tool_use_result` sibling
+    (`stdout`/`stderr`/`interrupted`), `content_block.caller`, the `cache_creation`
+    sub-object, and `system` `task_started`/`task_progress`/`task_notification`
+    subtypes survive only in `Raw`. The TUI (LIVE `✓/✗`, AGENTS tree) and journal
+    will want several of these. **`rate_limit_event` epoch regression: FIXED (2.6b)** — `ResetAt` in `observe.go` now only advances to a later epoch, never regresses to an earlier one (conservative usage-wait). Remaining gaps → task 2.6(c)(d).
+11. **Outbound stream-json encoder: NOW EXISTS (2.6a DONE).** `stream.EncodeUserMessage` (`src/lib/stream/encode.go`) produces the outbound user-turn NDJSON line; round-trips through the inbound Decoder (test-locked). **Supervisor un-missable stdin contract: IMPLEMENTED (2.5 DONE)** — `supervise.Start` errors if `StreamInput && Prompt==""` and owns the initial prompt write to stdin, so the missing-write bug is caught at call time. The only remaining 2.6 hard-dependency for 3.11 is consuming `EncodeUserMessage` for the `Inject` path — that wiring belongs to 3.11 itself.
+12. **Loop-engine scoping requirements the items hadn't spelled out** (now folded
+    into 3.x): per-iteration **store hot-reload** for in-loop splits (→3.1);
+    **stall-counter reset** semantics (→3.9); **`max_cycles`/`cycles_used`**
+    increment+cap (→3.12); **soft-wind-down fallthrough** to hard-kill when
+    `stream_input=false` (→3.11); **reconciliation order** agent-status-first then
+    git-diff inference, incl. the deferred RUNNING-crash git-reconcile (→3.5);
+    **iteration-budget apportionment** plan-vs-build, spec-06 OPEN (→5.1/3.8).
+13. **Discuss mode has thin plan coverage** (new tasks 7.5/7.6): no item for the
+    discuss agent's **system/role prompt**, none for **`specs/`-scope write
+    enforcement**, none for the **long-lived per-turn injection loop**, and three
+    spec-05 OPENs uncovered (discuss context-exhaustion, pre-handoff readiness
+    check, re-enter-discuss-during-paused-build).
+14. **`[tui]` config section absent** `[CONFIRMED]`. `Config` has no `TUI`/theme
+    section, yet 6.1 promises `[tui].theme` overrides — add it to `src/lib/config`
+    before 6.1 (→ noted on 6.1). Per-role override keys remain spec-OPEN.
+15. **Logging: no `[logging]` section / level not config-wired; no rotation.** The
+    `logging.ParseLevel` helper exists but nothing maps a config field to it (level
+    is hardcoded at `runOrchestrate`). Rotation is deferred-by-design (task 0.3
+    note) — fine for now, revisit for multi-day unattended runs. Minor; fold into
+    the 0.5/`[tui]` config-section work or a later config pass.
+16. **Small task-model gaps** (→ task 1.7): `id`↔filename-prefix not validated at
+    load; `attempts` has no typed accessor/setter; no `SetNotes`/`SetFiles`. All
+    minor / partly spec-OPEN; close against the Phase-3/4 consumers that need them.
+17. **Stale code comment** `[trivial]`. `src/lib/state/state.go:250-252` still says
+    "the journal is tier 2, **not built yet** — 1.6"; the `src/lib/journal` package
+    now exists (1.6 done). `state.Rebuild` correctly still does NO journal
+    enrichment (that's the orchestrator's job, Phase 5), so this is a comment-only
+    cleanup — fix it when the orchestrator wires journal-tier rebuild in Phase 5,
+    not before.
 
 ## Build conventions
 
