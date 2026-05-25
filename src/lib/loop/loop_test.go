@@ -28,6 +28,11 @@ func setupProject(t *testing.T, tasks ...*task.Task) (*config.Config, *paths.Pat
 	t.Helper()
 	root := t.TempDir()
 	cfg := config.Default()
+	// These shared-fixture tests are not about checkpointing (and run on a non-repo
+	// temp dir), so disable it here; the dedicated checkpoint_test.go opts back in
+	// with a real repo. The read-side git signal (WorkHappened/FilesTouched) is
+	// independent of this flag, so the git-signal tests below are unaffected.
+	cfg.Git.Enabled = false
 	p, err := paths.NewFromConfig(root, &cfg)
 	if err != nil {
 		t.Fatalf("paths.NewFromConfig: %v", err)
@@ -86,7 +91,7 @@ func TestIterateSelectsComposesSpawnsJournals(t *testing.T) {
 		}, nil
 	}
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -189,7 +194,7 @@ func TestIterateStatusAfterReflectsAgentEdit(t *testing.T) {
 		return &supervise.Result{Observation: &stream.LoopObservation{Done: true, Subtype: "success"}, ExitCode: 0}, nil
 	}
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -218,7 +223,7 @@ func TestIterateNoWorkAllDone(t *testing.T) {
 		spawned = true
 		return nil, nil
 	}
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -240,7 +245,7 @@ func TestIterateNoWorkStalled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -260,7 +265,7 @@ func TestIterateCycleErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if _, err := d.Iterate(context.Background(), "build"); err == nil {
+	if _, err := d.Iterate(context.Background(), "build", 1); err == nil {
 		t.Fatal("Iterate over a dependency cycle returned no error")
 	}
 }
@@ -292,7 +297,7 @@ func TestIterateRealSupervisorArchivesStream(t *testing.T) {
 		return supervise.Run(ctx, spec)
 	}
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -350,7 +355,7 @@ func TestIterateTestGatePasses(t *testing.T) {
 	}
 	d.run = stubSuccess
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -381,7 +386,7 @@ func TestIterateTestGateFails(t *testing.T) {
 	}
 	d.run = stubSuccess // agent reports success…
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -410,7 +415,7 @@ func TestIteratePlanPhaseSkipsGate(t *testing.T) {
 	}
 	d.run = stubSuccess
 
-	res, err := d.Iterate(context.Background(), "plan")
+	res, err := d.Iterate(context.Background(), "plan", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -441,7 +446,7 @@ func TestIterateNonSuccessSkipsGate(t *testing.T) {
 		return &supervise.Result{Observation: &stream.LoopObservation{IsError: true}, ExitCode: 1}, nil
 	}
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -495,7 +500,7 @@ func TestIterateReconcilePromotesOnPassingGate(t *testing.T) {
 	}
 	d.run = stubSuccess // agent leaves status pending
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -537,7 +542,7 @@ func TestIterateReconcileNormalizesActive(t *testing.T) {
 		return &supervise.Result{Observation: &stream.LoopObservation{Done: true, Subtype: "success"}, ExitCode: 0}, nil
 	}
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -567,7 +572,7 @@ func TestIterateRespectsAgentBlocked(t *testing.T) {
 		return &supervise.Result{Observation: &stream.LoopObservation{Done: true, Subtype: "success"}, ExitCode: 0}, nil
 	}
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -602,7 +607,7 @@ func TestIterateRecordsGitWork(t *testing.T) {
 		return &supervise.Result{Observation: &stream.LoopObservation{Done: true, Subtype: "success"}, ExitCode: 0}, nil
 	}
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}
@@ -631,7 +636,7 @@ func TestIterateNonRepoNoGitSignal(t *testing.T) {
 	}
 	d.run = stubSuccess
 
-	res, err := d.Iterate(context.Background(), "build")
+	res, err := d.Iterate(context.Background(), "build", 1)
 	if err != nil {
 		t.Fatalf("Iterate: %v", err)
 	}

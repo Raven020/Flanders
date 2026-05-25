@@ -9,6 +9,8 @@
 //  6. evaluate— reconcile the task's status (spec 02 §Mutation ownership) and
 //     record the git "did work happen" signal (+ archive the raw transcript and a
 //     summary, incl. the test result and reconciled status, to the journal)
+//  7. checkpoint — on progress (a status change or a passing test gate), commit the
+//     working tree so the iteration is revertable (spec 01 §Checkpointing)
 //
 // Why a driver that runs exactly one iteration, not a loop. Ralph's defining rule
 // is "fresh context every iteration; durable state on disk" (spec 01 §Principle).
@@ -37,9 +39,12 @@
 // exit code, not the agent's self-report). It runs only for the code-producing
 // phases (build/test) on a cleanly-completed invocation, and its test result is
 // recorded in the journal and surfaced on Result for the orchestrator's
-// done-detection (plan task 3.7). What this package still defers (each its own
-// plan item, wired into the same Iterate spine when it lands): git checkpointing
-// (3.6) and the context/stall/usage guardrails (3.8–3.12). The prompt composition
+// done-detection (plan task 3.7). The checkpoint step (7, checkpoint.go) commits the
+// loop's work on progress per [git].commit_each (spec 01 §Checkpointing) and surfaces
+// the new commit sha on Result for the orchestrator to persist as state.last_checkpoint
+// (spec 09); it does NOT touch state.json itself. What this package still defers (each
+// its own plan item, wired into the same Iterate spine when it lands): the
+// context/stall/usage guardrails (3.8–3.12). The prompt composition
 // (compose.go) is the full cost/quality lever (plan task 3.2): the current task file
 // + the outcomes of its dependencies + only the spec excerpts it references + a
 // one-line plan summary, with the loop rules appended as a system prompt. None of
@@ -173,13 +178,22 @@ type Result struct {
 	// FilesTouched is the sorted set of paths changed this loop (also recorded in
 	// the journal). Empty when nothing changed or the target is not a git repo.
 	FilesTouched []string
+
+	// Checkpoint is the git commit sha created this loop (spec 01 §Checkpointing),
+	// or "" when no commit was made: no progress in the default `progress` mode,
+	// checkpointing off ([git].enabled=false or commit_each="off"), a clean tree, or
+	// a non-repo target the run is not permitted to init. The orchestrator persists a
+	// non-empty value to state.last_checkpoint (spec 09).
+	Checkpoint string
 }
 
 // Iterate runs one Ralph loop in the given phase (build|plan|test|split — the
-// values config.PhaseClass understands) and returns what happened. It performs
-// steps 1–4 of the iteration anatomy (select → compose → spawn → observe) and
-// records the loop in the journal; the verify/evaluate/checkpoint steps are added
-// by later plan tasks (see package doc).
+// values config.PhaseClass understands) and returns what happened. It performs the
+// full iteration anatomy: select → compose → spawn → observe → verify → evaluate →
+// checkpoint, recording the loop in the journal. iter is the orchestrator's per-phase
+// iteration number (state.iter), used only for the checkpoint commit message's
+// {iter} variable — the driver itself owns no iteration counter (that is Phase 5's
+// run-state machine).
 //
 // A returned error is an infrastructure failure (couldn't read the plan, build the
 // command, or spawn the process) — the orchestrator should surface and halt. A
@@ -187,7 +201,7 @@ type Result struct {
 // a timeout) is NOT an error here: it completes normally with Result.Outcome set,
 // because that is a routine, recordable outcome the guardrails act on, not a
 // harness fault.
-func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
+func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, error) {
 	start := d.now()
 
 	// 1. SELECT — rebuild the store from disk (hot-reload, see package doc) and
@@ -311,12 +325,19 @@ func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
 		return nil, fmt.Errorf("loop: journal task %s: %w", t.ID(), err)
 	}
 
+	// 7. CHECKPOINT — on progress, commit the working tree so the iteration is
+	// revertable (spec 01 §Checkpointing). Best-effort: the journal entry is already
+	// written above and the work is on disk, so a commit failure is logged inside
+	// checkpoint, not fatal here. The new commit sha (or "") is surfaced on Result
+	// for the orchestrator to persist as state.last_checkpoint (spec 09).
+	checkpointSHA := d.checkpoint(ctx, phase, iter, t, after, vr)
+
 	d.log.Info("loop iteration complete",
 		"phase", phase, "task", t.ID(), "session", sid,
 		"outcome", outcome.String(), "exit", res.ExitCode,
 		"timed_out", res.TimedOut, "journal_seq", seq,
 		"status_after", sum.StatusAfter, "reconcile", rec.Action, "work_happened", workHappened,
-		"test_passed", sum.Test.Passed(), "cost_usd", obs.Cost)
+		"test_passed", sum.Test.Passed(), "checkpoint", checkpointSHA, "cost_usd", obs.Cost)
 
 	return &Result{
 		Phase:        phase,
@@ -332,6 +353,7 @@ func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
 		Reconcile:    rec,
 		WorkHappened: workHappened,
 		FilesTouched: files,
+		Checkpoint:   checkpointSHA,
 	}, nil
 }
 

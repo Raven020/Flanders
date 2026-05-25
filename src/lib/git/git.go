@@ -1,21 +1,31 @@
-// Package git is the harness's read-only window onto the target project's git
-// working tree. It answers two questions the harness owns and must never delegate
-// to the agent (specs/02-plan-and-tasks.md §Mutation ownership, spec
-// 09-state-and-resume.md §resume): "did work actually happen this loop?" (the
-// git-diff signal behind status reconciliation and the stall guardrail) and "which
-// files were touched?" (recorded in the journal).
+// Package git is the harness's window onto the target project's git working tree.
+// It has two clearly separated sides:
 //
-// Why reads only. Committing, staging, and `git init` are a separate, write-side
-// concern (checkpointing — plan task 3.6). Keeping them out of this package means a
-// status-inference path can never accidentally mutate the very repo it is
-// measuring — the measurement and the commit have different owners by construction.
+//   - A READ side (the original purpose): answering two questions the harness owns
+//     and must never delegate to the agent (specs/02-plan-and-tasks.md §Mutation
+//     ownership, spec 09-state-and-resume.md §resume): "did work actually happen this
+//     loop?" ([Diff]'s workHappened — the signal behind status reconciliation and the
+//     stall guardrail) and "which files were touched?" ([Diff]'s files — recorded in
+//     the journal). [IsRepo]/[HeadSHA]/[WorkingChanges]/[Snap]/[Diff] never mutate.
+//   - A WRITE side (checkpointing — plan task 3.6): [Init]/[AddAll]/[Commit] and the
+//     [Checkpoint] convenience that commits the loop's work so Ralph iterations are
+//     revertable (spec 01 §Checkpointing, step 7 of the loop anatomy).
+//
+// Why one package, two sides. The split is by FUNCTION, not by file: status
+// reconciliation calls only the read side, so a status-inference path still can never
+// accidentally mutate the repo it is measuring — that ownership boundary is enforced
+// at the call sites (src/lib/reconcile imports task only; the loop driver reads before
+// the loop and writes the checkpoint after). Keeping both in one `git` package means a
+// single, audited shell-out helper ([run]) and no second copy of the same conventions.
 //
 // Why best-effort, never fatal. Every call is scoped to an explicit dir (via
 // `git -C <dir>`) so the harness can drive a target that lives anywhere, and a
 // missing git binary or a non-repo target yields "no signal" rather than an error
-// on the hot path of every loop. Callers gate on [IsRepo] (or read [Snapshot.IsRepo])
-// and simply lean on the test gate alone when git can say nothing; the orchestrator
-// may then offer `git init` (spec 03 [git].init_if_missing, task 3.6).
+// on the hot path of every loop. Read callers gate on [IsRepo] (or read
+// [Snapshot.IsRepo]) and lean on the test gate alone when git can say nothing; the
+// checkpoint caller treats a commit failure as a logged, non-fatal event (the work is
+// already on disk and journaled) and may `git init` first when [Init] is permitted
+// (spec 03 [git].init_if_missing).
 package git
 
 import (
@@ -155,4 +165,66 @@ func Diff(before, after Snapshot) (workHappened bool, files []string) {
 	}
 	sort.Strings(files)
 	return workHappened, files
+}
+
+// Init initializes a new git repository in dir (`git init`). It is the write-side
+// counterpart to [IsRepo] for the checkpoint step: when the target project is not yet
+// a repo and the config permits (spec 03 [git].init_if_missing), the harness creates
+// one so iterations become revertable (spec 01 §Checkpointing). `git init` is
+// idempotent, but callers gate on [IsRepo] to avoid the needless work and the log noise.
+func Init(ctx context.Context, dir string) error {
+	_, err := run(ctx, dir, "init", "-q")
+	return err
+}
+
+// AddAll stages every change in the working tree (`git add -A`) — modifications, new
+// (untracked) files, and deletions — so the next [Commit] captures the loop's full
+// output. The harness checkpoints the whole tree, not a curated subset: a Ralph
+// iteration's unit of work is "whatever this loop changed," and a partial stage could
+// leave the commit out of step with the journal's recorded file list.
+func AddAll(ctx context.Context, dir string) error {
+	_, err := run(ctx, dir, "add", "-A")
+	return err
+}
+
+// Commit records the currently staged changes with message and returns the new HEAD
+// sha. It assumes something is staged; a clean index makes `git commit` exit non-zero
+// ("nothing to commit"), surfaced here as an error — [Checkpoint] guards against that
+// so the no-progress case is never mistaken for a failure. A missing commit identity
+// (no user.name/email configured anywhere) is likewise a real, returned error.
+func Commit(ctx context.Context, dir, message string) (string, error) {
+	if _, err := run(ctx, dir, "commit", "-q", "-m", message); err != nil {
+		return "", err
+	}
+	return HeadSHA(ctx, dir), nil
+}
+
+// Checkpoint stages all working-tree changes and commits them with message, returning
+// the new commit sha. It is the harness's revertable-iteration commit (spec 01
+// §Checkpointing, step 7 of the loop anatomy). A clean tree — the agent already
+// committed, or the loop changed nothing — is a NO-OP, not a failure: it returns
+// (sha="", committed=false, err=nil) so the caller never mistakes "no changes" for
+// "commit broke". Any real git failure (e.g. no commit identity) is returned. This
+// also leaves the tree clean for the next loop, which is what makes [Diff]'s
+// newly-touched-file set exactly that next loop's own changes.
+func Checkpoint(ctx context.Context, dir, message string) (sha string, committed bool, err error) {
+	if err := AddAll(ctx, dir); err != nil {
+		return "", false, err
+	}
+	// After `add -A`, `git status --porcelain` reports the staged changes; an empty
+	// result means the tree was already clean (incl. a fresh, file-less repo), so
+	// there is nothing to commit. This is cheaper and clearer than committing and
+	// parsing the "nothing to commit" error back out.
+	changes, err := WorkingChanges(ctx, dir)
+	if err != nil {
+		return "", false, err
+	}
+	if len(changes) == 0 {
+		return "", false, nil
+	}
+	sha, err = Commit(ctx, dir, message)
+	if err != nil {
+		return "", false, err
+	}
+	return sha, true, nil
 }
