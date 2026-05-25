@@ -79,7 +79,8 @@ func planSummary(store *task.Store) string {
 // stream protocol (journal package doc).
 func (d *Driver) buildSummary(
 	phase string,
-	t *task.Task,
+	t *task.Task, // the task as selected (pre-loop): source of StatusBefore
+	after *task.Task, // the task after the loop + reconciliation: source of StatusAfter/Reason
 	sessionID string,
 	class config.AgentClass,
 	res *supervise.Result,
@@ -87,6 +88,7 @@ func (d *Driver) buildSummary(
 	start time.Time,
 	outcome stream.Outcome,
 	vr *verify.Result,
+	files []string, // paths touched this loop, from git diff (empty if none / non-repo)
 ) *journal.Summary {
 	// Prefer the CLI's own reported duration (result.duration_ms) when present; fall
 	// back to the harness wall-clock (e.g. a killed loop never reports a duration).
@@ -114,6 +116,9 @@ func (d *Driver) buildSummary(
 		// StatusBefore is the status at selection — always `pending`, since Next only
 		// returns pending tasks (spec 01 §select). Recorded for an honest transition.
 		StatusBefore: t.Status(),
+		// Files touched this loop, inferred by the harness from git diff (spec 02);
+		// empty when nothing changed or the target is not a git repo.
+		Files: files,
 	}
 
 	// Test records the ground-truth gate verdict (spec 01 §journal: "test result").
@@ -132,16 +137,12 @@ func (d *Driver) buildSummary(
 		sum.Subagents = append(sum.Subagents, journal.Subagent{Name: sa.SubagentType})
 	}
 
-	// StatusAfter / Reason: re-read the task file from disk, because the agent edits
-	// its own `status` during the loop (spec 02 §Mutation ownership) and the in-memory
-	// task predates those edits. A read failure (e.g. the agent deleted the file)
-	// falls back to the pre-loop status rather than failing the journal write.
-	if after, err := task.ParseFile(t.Path); err == nil {
-		sum.StatusAfter = after.Status()
-		sum.Reason = after.Reason()
-	} else {
-		sum.StatusAfter = t.Status()
-	}
+	// StatusAfter / Reason come from `after`: the task as it stands once the agent's
+	// own mid-run edits and the harness's reconciliation (spec 02 §Mutation ownership)
+	// have both been applied. So the journal records the net, final transition for the
+	// loop — pending → (agent flip | harness promotion | normalization).
+	sum.StatusAfter = after.Status()
+	sum.Reason = after.Reason()
 
 	sum.Error = errorText(res, obs, outcome)
 	return sum

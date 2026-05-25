@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"flanders/src/lib/invoke"
 	"flanders/src/lib/journal"
 	"flanders/src/lib/paths"
+	"flanders/src/lib/reconcile"
 	"flanders/src/lib/stream"
 	"flanders/src/lib/supervise"
 	"flanders/src/lib/task"
@@ -448,6 +450,193 @@ func TestIterateNonSuccessSkipsGate(t *testing.T) {
 	}
 	if res.Verify != nil {
 		t.Errorf("Verify = %+v, want nil (gate skipped on a non-success invocation)", res.Verify)
+	}
+}
+
+// initGitRepo turns dir into a git repo with a deterministic identity and commits
+// the current tree, so a loop's snapshot starts from a clean baseline.
+func initGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "test@flanders.local"},
+		{"config", "user.name", "Flanders Test"},
+		{"config", "commit.gpgsign", "false"},
+		{"add", "-A"},
+		{"commit", "-qm", "baseline"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestIterateReconcilePromotesOnPassingGate is the headline 3.5 acceptance: the
+// agent finished the loop without flipping status (still pending), but the harness
+// test gate passed — so the harness records the `done` the agent forgot, both on
+// disk and in the journal. The outcome is recorded whether the agent flipped it or not.
+func TestIterateReconcilePromotesOnPassingGate(t *testing.T) {
+	cfg, p, jr := setupProject(t, mkTask("0001", task.StatusPending, nil))
+	cfg.Commands.Test = "exit 0"
+	taskPath := filepath.Join(p.Tasks, "0001.md")
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.run = stubSuccess // agent leaves status pending
+
+	res, err := d.Iterate(context.Background(), "build")
+	if err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	if res.Reconcile.Action != reconcile.ActionPromoted || res.Reconcile.To != task.StatusDone {
+		t.Errorf("Reconcile = %+v, want Promoted→done", res.Reconcile)
+	}
+	if after, _ := task.ParseFile(taskPath); after.Status() != task.StatusDone {
+		t.Errorf("on-disk status = %q, want done (harness promoted it)", after.Status())
+	}
+	sum, err := jr.Read(res.JournalSeq)
+	if err != nil {
+		t.Fatalf("journal.Read: %v", err)
+	}
+	if sum.StatusBefore != task.StatusPending || sum.StatusAfter != task.StatusDone {
+		t.Errorf("journal transition = %q→%q, want pending→done", sum.StatusBefore, sum.StatusAfter)
+	}
+}
+
+// TestIterateReconcileNormalizesActive: the agent set the task `active` while
+// working but never flipped on exit, and no test gate proved it done. Since the
+// selector only re-picks `pending`, the harness normalizes the stuck `active` back
+// to `pending` so the task is retried next loop.
+func TestIterateReconcileNormalizesActive(t *testing.T) {
+	cfg, p, jr := setupProject(t, mkTask("0001", task.StatusPending, nil))
+	taskPath := filepath.Join(p.Tasks, "0001.md")
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.run = func(_ context.Context, _ supervise.Spec) (*supervise.Result, error) {
+		tk, err := task.ParseFile(taskPath)
+		if err != nil {
+			t.Fatalf("agent reload: %v", err)
+		}
+		tk.SetStatus(task.StatusActive) // agent marks active, then "crashes" without flipping
+		if err := tk.WriteFile(taskPath); err != nil {
+			t.Fatalf("agent write: %v", err)
+		}
+		return &supervise.Result{Observation: &stream.LoopObservation{Done: true, Subtype: "success"}, ExitCode: 0}, nil
+	}
+
+	res, err := d.Iterate(context.Background(), "build")
+	if err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	if res.Reconcile.Action != reconcile.ActionNormalized || res.Reconcile.To != task.StatusPending {
+		t.Errorf("Reconcile = %+v, want Normalized→pending", res.Reconcile)
+	}
+	if after, _ := task.ParseFile(taskPath); after.Status() != task.StatusPending {
+		t.Errorf("on-disk status = %q, want pending (normalized from active)", after.Status())
+	}
+}
+
+// TestIterateRespectsAgentBlocked: an explicit agent block (with reason) is honored
+// verbatim — the harness does not second-guess it, and the reason reaches the journal.
+func TestIterateRespectsAgentBlocked(t *testing.T) {
+	cfg, p, jr := setupProject(t, mkTask("0001", task.StatusPending, nil))
+	taskPath := filepath.Join(p.Tasks, "0001.md")
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.run = func(_ context.Context, _ supervise.Spec) (*supervise.Result, error) {
+		tk, _ := task.ParseFile(taskPath)
+		tk.SetBlocked(task.ReasonContextOverreach)
+		if err := tk.WriteFile(taskPath); err != nil {
+			t.Fatalf("agent write: %v", err)
+		}
+		return &supervise.Result{Observation: &stream.LoopObservation{Done: true, Subtype: "success"}, ExitCode: 0}, nil
+	}
+
+	res, err := d.Iterate(context.Background(), "build")
+	if err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	if res.Reconcile.Action != reconcile.ActionRespected || res.Reconcile.To != task.StatusBlocked {
+		t.Errorf("Reconcile = %+v, want Respected→blocked", res.Reconcile)
+	}
+	sum, err := jr.Read(res.JournalSeq)
+	if err != nil {
+		t.Fatalf("journal.Read: %v", err)
+	}
+	if sum.StatusAfter != task.StatusBlocked || sum.Reason != task.ReasonContextOverreach {
+		t.Errorf("journal = %q/%q, want blocked/context-overreach", sum.StatusAfter, sum.Reason)
+	}
+}
+
+// TestIterateRecordsGitWork: when the target is a git repo, the harness records
+// which files the loop touched and that work happened (spec 02 §Mutation ownership)
+// — the git-diff signal status reconciliation and the stall guardrail (3.9) read.
+// Surfaced on Result and recorded in the journal Files field.
+func TestIterateRecordsGitWork(t *testing.T) {
+	cfg, p, jr := setupProject(t, mkTask("0001", task.StatusPending, nil))
+	initGitRepo(t, p.Root) // commit the project (tasks/config) → clean baseline
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.run = func(_ context.Context, _ supervise.Spec) (*supervise.Result, error) {
+		// The "agent" lands a new source file in the repo this loop.
+		if err := os.WriteFile(filepath.Join(p.Root, "feature.go"), []byte("package main\n"), 0o644); err != nil {
+			t.Fatalf("agent write source: %v", err)
+		}
+		return &supervise.Result{Observation: &stream.LoopObservation{Done: true, Subtype: "success"}, ExitCode: 0}, nil
+	}
+
+	res, err := d.Iterate(context.Background(), "build")
+	if err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	if !res.WorkHappened {
+		t.Error("WorkHappened = false, want true (a source file was added)")
+	}
+	if !contains(res.FilesTouched, "feature.go") {
+		t.Errorf("FilesTouched = %v, want to contain feature.go", res.FilesTouched)
+	}
+	sum, err := jr.Read(res.JournalSeq)
+	if err != nil {
+		t.Fatalf("journal.Read: %v", err)
+	}
+	if !contains(sum.Files, "feature.go") {
+		t.Errorf("journal Files = %v, want to contain feature.go", sum.Files)
+	}
+}
+
+// TestIterateNonRepoNoGitSignal: a non-repo target yields no git signal — work is
+// reported false and no files touched, but reconciliation (test gate) still runs.
+func TestIterateNonRepoNoGitSignal(t *testing.T) {
+	cfg, p, jr := setupProject(t, mkTask("0001", task.StatusPending, nil))
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d.run = stubSuccess
+
+	res, err := d.Iterate(context.Background(), "build")
+	if err != nil {
+		t.Fatalf("Iterate: %v", err)
+	}
+	if res.WorkHappened || res.FilesTouched != nil {
+		t.Errorf("non-repo: WorkHappened=%v Files=%v, want false/nil", res.WorkHappened, res.FilesTouched)
 	}
 }
 

@@ -6,8 +6,9 @@
 //  3. spawn   — invoke a fresh `claude -p` session and supervise it
 //  4. observe — fold the stream-json into a LoopObservation, classify the outcome
 //  5. verify  — run the harness-owned ground-truth test gate (spec 01 §verify)
-//     (+ archive the raw transcript and a summary, incl. the test result, to the
-//     journal)
+//  6. evaluate— reconcile the task's status (spec 02 §Mutation ownership) and
+//     record the git "did work happen" signal (+ archive the raw transcript and a
+//     summary, incl. the test result and reconciled status, to the journal)
 //
 // Why a driver that runs exactly one iteration, not a loop. Ralph's defining rule
 // is "fresh context every iteration; durable state on disk" (spec 01 §Principle).
@@ -23,13 +24,13 @@
 // rebuilt from specs/tasks/*.md at the TOP of every Iterate, never cached across
 // loops. The files on disk are the single source of truth (spec 02 §Storage).
 //
-// Why status mutation is NOT done here. Spec 02 §Mutation ownership locks that the
-// agent flips its task's `status` (`active` while working, `done`/`blocked` on
-// exit) and the harness cross-checks via git diff + the test command. The driver
-// therefore reads the task's status before and after the loop (so the journal
-// records the transition the agent made) but does not itself write status — the
-// verify/reconcile step (plan task 3.5) owns the inference fallback and the
-// harness-writes-status-on-kill path.
+// How status mutation is split. Spec 02 §Mutation ownership locks that the agent
+// flips its task's `status` (`active` while working, `done`/`blocked` on exit) and
+// the harness cross-checks via the signals it owns. The driver re-reads the task
+// after the loop and runs the evaluate step through src/lib/reconcile: it respects
+// an agent-written terminal status, otherwise promotes to `done` when the test gate
+// passed, otherwise normalizes a stuck `active` back to `pending` (see that package
+// for the policy). So the outcome is recorded whether the agent flipped it or not.
 //
 // The verify step (5) runs the harness-owned test gate (src/lib/verify) — the
 // ground truth for "done" (spec 01 §done-detection: the canonical test command's
@@ -37,9 +38,9 @@
 // phases (build/test) on a cleanly-completed invocation, and its test result is
 // recorded in the journal and surfaced on Result for the orchestrator's
 // done-detection (plan task 3.7). What this package still defers (each its own
-// plan item, wired into the same Iterate spine when it lands): status
-// reconciliation (3.5), git checkpointing (3.6), and the context/stall/usage
-// guardrails (3.8–3.12). The prompt composition here is the minimal version (the
+// plan item, wired into the same Iterate spine when it lands): git checkpointing
+// (3.6) and the context/stall/usage guardrails (3.8–3.12). The prompt composition
+// here is the minimal version (the
 // task file + a one-line plan summary); the richer composition (dependency
 // outcomes, named spec excerpts) is plan task 3.2. None of these are stubbed —
 // they are simply not yet steps of the iteration; the driver returns the
@@ -58,9 +59,11 @@ import (
 	"time"
 
 	"flanders/src/lib/config"
+	"flanders/src/lib/git"
 	"flanders/src/lib/invoke"
 	"flanders/src/lib/journal"
 	"flanders/src/lib/paths"
+	"flanders/src/lib/reconcile"
 	"flanders/src/lib/stream"
 	"flanders/src/lib/supervise"
 	"flanders/src/lib/task"
@@ -155,6 +158,20 @@ type Result struct {
 	// timeout): in those cases there is nothing meaningful to test. When non-nil,
 	// Verify.Passed() is the harness-owned "done" signal done-detection (3.7) reads.
 	Verify *verify.Result
+
+	// Reconcile is what the harness decided about the task's status after the loop
+	// (spec 02 §Mutation ownership): it respected the agent's flip, promoted to
+	// `done` on a passing gate, normalized a stuck `active`, or left it unchanged.
+	Reconcile reconcile.Result
+
+	// WorkHappened reports whether git showed the working tree change this loop
+	// (HEAD advanced or the dirty-file set changed). It is the signal the stall
+	// guardrail (task 3.9) and resume reconciliation (spec 09) read; false when the
+	// target is not a git repo (no signal available).
+	WorkHappened bool
+	// FilesTouched is the sorted set of paths changed this loop (also recorded in
+	// the journal). Empty when nothing changed or the target is not a git repo.
+	FilesTouched []string
 }
 
 // Iterate runs one Ralph loop in the given phase (build|plan|test|split — the
@@ -215,6 +232,12 @@ func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loop: build invocation: %w", err)
 	}
+	// Snapshot the git working tree just before the agent runs, so the after-loop
+	// snapshot (step 6) reveals what THIS loop touched — the harness's own "did work
+	// happen" signal (spec 02 §Mutation ownership), not the cumulative tree state.
+	// Best-effort: a non-repo target yields an inert snapshot and no signal.
+	pre := git.Snap(ctx, d.paths.Root)
+
 	var raw bytes.Buffer
 	res, err := d.run(ctx, supervise.Spec{
 		Command:     cmd,
@@ -255,8 +278,32 @@ func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
 		}
 	}
 
+	// 6. EVALUATE — record the git "did work happen" signal for THIS loop, then
+	// reconcile the task's status (spec 02 §Mutation ownership). Reconciliation reads
+	// the task as the agent left it on disk, so re-read it here: the agent edits its
+	// own `status` mid-run, and the in-memory `t` predates those edits. A read failure
+	// (e.g. the agent clobbered the file) skips reconciliation rather than risk
+	// rewriting an unreadable file — the journal then records the pre-loop status.
+	workHappened, files := git.Diff(pre, git.Snap(ctx, d.paths.Root))
+
+	after := t
+	var rec reconcile.Result
+	if reloaded, rerr := task.ParseFile(t.Path); rerr == nil {
+		after = reloaded
+		rec, err = reconcile.Reconcile(after, reconcile.Signals{
+			TestRan:    vr != nil && vr.Test.Ran,
+			TestPassed: vr != nil && vr.Passed(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("loop: reconcile task %s: %w", t.ID(), err)
+		}
+	} else {
+		d.log.Warn("reconcile skipped: task file unreadable after loop", "task", t.ID(), "err", rerr)
+		rec = reconcile.Result{Action: reconcile.ActionUnchanged, From: t.Status(), To: t.Status()}
+	}
+
 	class, _ := d.cfg.PhaseClass(phase) // phase already validated by invoke.Build above
-	sum := d.buildSummary(phase, t, sid, class, res, obs, start, outcome, vr)
+	sum := d.buildSummary(phase, t, after, sid, class, res, obs, start, outcome, vr, files)
 	seq, err := d.journal.Append(sum, &raw)
 	if err != nil {
 		return nil, fmt.Errorf("loop: journal task %s: %w", t.ID(), err)
@@ -266,19 +313,23 @@ func (d *Driver) Iterate(ctx context.Context, phase string) (*Result, error) {
 		"phase", phase, "task", t.ID(), "session", sid,
 		"outcome", outcome.String(), "exit", res.ExitCode,
 		"timed_out", res.TimedOut, "journal_seq", seq,
-		"status_after", sum.StatusAfter, "test_passed", sum.Test.Passed(), "cost_usd", obs.Cost)
+		"status_after", sum.StatusAfter, "reconcile", rec.Action, "work_happened", workHappened,
+		"test_passed", sum.Test.Passed(), "cost_usd", obs.Cost)
 
 	return &Result{
-		Phase:       phase,
-		Task:        t,
-		SessionID:   sid,
-		Observation: obs,
-		Outcome:     outcome,
-		ExitCode:    res.ExitCode,
-		TimedOut:    res.TimedOut,
-		JournalSeq:  seq,
-		Duration:    d.now().Sub(start),
-		Verify:      vr,
+		Phase:        phase,
+		Task:         t,
+		SessionID:    sid,
+		Observation:  obs,
+		Outcome:      outcome,
+		ExitCode:     res.ExitCode,
+		TimedOut:     res.TimedOut,
+		JournalSeq:   seq,
+		Duration:     d.now().Sub(start),
+		Verify:       vr,
+		Reconcile:    rec,
+		WorkHappened: workHappened,
+		FilesTouched: files,
 	}, nil
 }
 
