@@ -1,17 +1,21 @@
 # Flanders — Implementation Plan
 
 > **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 COMPLETE — all of
-> 1.1–1.6 done. Go module (`module flanders`, go 1.24), layout (`src/cmd/flanders`
-> + `src/lib/{paths,logging,config,task,state,journal}`), file-backed slog logger,
-> paths helper, config loader + default-file writer, the task-file model, the task
+> 1.1–1.6 done. Phase 2.1 COMPLETE — stream-json parser. Go module (`module
+> flanders`, go 1.24), layout (`src/cmd/flanders` + `src/lib/{paths,logging,
+> config,task,state,journal,stream}`), file-backed slog logger, paths helper,
+> config loader + default-file writer, the task-file model, the task
 > store/selector, the state cache (`src/lib/state`, wired into `main` for startup
-> load), and the journal (`src/lib/journal`, wired into `main` after state load)
-> all exist with passing tests. `src/cmd/flanders/main.go` now has a real
-> dispatcher: `init` → writes a commented default config; bare `flanders` →
+> load), the journal (`src/lib/journal`, wired into `main` after state load), and
+> the stream-json parser (`src/lib/stream`, typed events + `LoopObservation`
+> aggregator, fixture-based tests against real captured `claude 2.1.150`
+> transcripts) all exist with passing tests. `src/cmd/flanders/main.go` now has a
+> real dispatcher: `init` → writes a commented default config; bare `flanders` →
 > orchestrate startup; `discuss|plan|build` → honest "not implemented yet" error;
 > unknown → usage error (stdlib only, no CLI framework). `Version` const is
-> `0.0.7`; tag `0.0.7` will be created. `go build ./...`, `go vet ./...`, and
-> `go test ./...` are all green. **Next up: Phase 2 (2.1 Stream-json parser)**.
+> `0.0.8`; tag `0.0.8` will be created. `go build ./...`, `go vet ./...`, and
+> `go test ./...` are all green. **Next up: Phase 2.2 (Live token /
+> context-occupancy tracker)**.
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -241,13 +245,54 @@
 
 ## Phase 2 — Agent integration & stream-json  `[depends: 1; highest technical risk]`
 
-- [ ] **2.1 Stream-json parser** in `src/lib` (`08-stream-json-protocol.md`).
+- [x] **2.1 Stream-json parser** in `src/lib` (`08-stream-json-protocol.md`).
   Streaming NDJSON decoder → typed events + a derived `LoopObservation` (tokens,
   cost, tool calls, subagent spawns, result/error, usage-limit + reset). Skip
   unparseable lines without crashing; preserve unknown types for the journal.
   *Acceptance:* fixture-based test over a captured real `claude 2.1.x` transcript
   asserts text/tool_use/result/token-usage extraction. **Capture a real transcript
   first** to pin wire shapes (spec 08 OPEN).
+  (Implemented in NEW package `src/lib/stream` (package `stream`), stdlib only
+  (`encoding/json`, `bufio`, `log/slog`) — NO new external dependency. Files:
+  `stream.go` (typed events + Decoder), `observe.go` (`LoopObservation` aggregator
+  + `Observe`/`ObserveFunc`), `stream_test.go` (9 tests), plus
+  `testdata/basic.jsonl` (a tool-call transcript) and `testdata/subagent.jsonl`
+  (a subagent-spawn transcript) — BOTH captured from REAL `claude 2.1.150` with
+  `-p --output-format stream-json --verbose --include-partial-messages
+  --dangerously-skip-permissions`. These fixtures ARE the contract (the spec-08
+  acceptance gate).
+  KEY DESIGN: line-oriented decoder (`bufio.Reader.ReadBytes`, no per-line length
+  cap so big tool inputs/thinking signatures/file contents don't overflow) →
+  `decodeLine` decodes a common envelope FIRST (`type`/`subtype`/`session_id`/
+  `uuid`/`parent_tool_use_id` + `Raw` verbatim line) so an UNKNOWN top-level type
+  still yields a usable `Event` with `Raw` preserved (forward-compatible); then a
+  type-specific payload decode that is non-fatal (a payload mismatch logs but keeps
+  the envelope+Raw, never loses a line). Unparseable lines are logged+skipped
+  (`Decoder.Skipped` counter), never crash. `Decoder.Next()` is the pull
+  primitive; `Stream(ctx, r, log)` is the channel wrapper the spec asked for.
+  `Observe`/`ObserveFunc(r, log, onEvent)` folds the stream into a single
+  `LoopObservation` (the spec's "one typed stream, no ad-hoc re-parsing");
+  `ObserveFunc`'s per-event hook is the seam for the journal (raw archiving) and
+  the Phase-2.2 live meter.
+  `LoopObservation` extracts: `Texts`, `ToolCalls` (with `Parent` attribution +
+  reconciled `tool_result` `IsError`/`Result`), `Subagents` (`Task`/`Agent`
+  `tool_use` → `subagent_type`+`description`), `PeakLeadTokens` (LEAD-only context
+  occupancy — subagent usage EXCLUDED on purpose per spec 01, tracked from
+  `stream_event`/assistant `usage` where `parent_tool_use_id=="""`),
+  `FinalUsage` (`result.usage` billing total incl. subagents), `Cost`,
+  `ContextWindow` (from `result.modelUsage` — the CLI reports it), `Done`/
+  `Subtype`/`IsError`/`ResultText`/`APIErrorStatus`, and usage-limit
+  (`UsageLimited`/`ResetAt`/`RateLimitType` from `rate_limit_event`).
+  `Occupancy(window)` helper falls back to the CLI-reported window when config
+  window is 0.
+  WIRE FINDINGS that extended the draft spec (all now PINNED into spec 08): a NEW
+  `rate_limit_event` carries a clean epoch `resetsAt` (the usage-limit reset is
+  NOT text-scraped — big de-risk for 2.3/3.12); `message_delta` carries FULL
+  cumulative usage not just output_tokens; `result.modelUsage.<model>.contextWindow`
+  (200000) means the CLI reports the window; the subagent-spawn tool is named
+  `Agent` in 2.1.150 (parser accepts `Agent` OR `Task`); `parent_tool_use_id`
+  attributes nested subagent activity. spec 08 has been updated from
+  draft→PINNED. 9 tests, full suite + build + vet green.)
 - [ ] **2.2 Live token / context-occupancy tracker.** Fold `message_start` /
   `message_delta` usage into a running % of `[context].window_tokens`; expose for
   meters + guardrail. *Acceptance:* synthetic stream drives the % monotonically;
@@ -414,8 +459,13 @@
 ## Findings — spec gaps & inconsistencies (for the plan/discuss loop to resolve)
 
 1. **Stream-json contract was undefined** → authored `specs/08-stream-json-protocol.md`
-   (draft; wire shapes marked OPEN until pinned vs CLI 2.1.x). *Highest technical
-   risk in the project.* See task **2.1–2.3**.
+   (RESOLVED/PINNED: wire shapes verified against `claude 2.1.150` with captured
+   fixtures in `src/lib/stream/testdata/`; spec 08 updated from draft→PINNED; task
+   2.1 DONE). The riskiest-parse concern (usage-limit detection) is structurally
+   de-risked: `rate_limit_event` carries a clean epoch `resetsAt` — no text-
+   scraping required. The exact exhausted-status string (how to distinguish a
+   usage-limit `result` from a genuine error) is still OPEN and will be pinned in
+   task **2.3**. Remaining risk: tasks **2.2–2.3**.
 2. **`state.json`** → authored `specs/09-state-and-resume.md` (draft) and IMPLEMENTED
    in `src/lib/state` (task 1.5 done). Persistence + recovery (missing/corrupt →
    rebuild from task store) are complete; the RUNNING-crash git-reconcile path is
@@ -436,10 +486,16 @@
    file the harness folds into that loop's prompt," but no path/format in
    `03-config.md`. Define it (task 8.2) — candidate `[paths].notes`.
 5. **Model→context-window table is OPEN** (`03-config.md`) but **required** to turn
-   token counts into a % when `window_tokens = 0` (task 2.2). Either ship a small
-   model→window map or require the number; decide before 2.2. (Loader side ready:
-   `config` already accepts `window_tokens = 0` as the "auto-detect by model"
-   sentinel; only the model→window map itself remains for 2.2.)
+   token counts into a % when `window_tokens = 0` (task 2.2). SUBSTANTIALLY
+   ANSWERED: the CLI reports `result.modelUsage.<model>.contextWindow` (e.g.
+   200000) at result time, surfaced as `LoopObservation.ContextWindow` — so the
+   window is available after the first completed loop without any hardcoded table.
+   STILL OPEN: live tracking *before* the first result (during the loop) still
+   needs either the config window or a model→window default — decide in 2.2
+   whether to ship a small static map or require `window_tokens` in config for the
+   live meter. (Loader side ready: `config` accepts `window_tokens = 0` as the
+   "auto-detect" sentinel; `Occupancy(window)` in `src/lib/stream` falls back to
+   the CLI-reported window when config window is 0.)
 6. **Plan-completeness method is OPEN** (`06`) — agent self-assessment vs. coverage
    check vs. (rejected) user approval. Pick one for task 4.3.
 7. **Stale spec note** — multiple specs say "the harness's own directory is not yet
