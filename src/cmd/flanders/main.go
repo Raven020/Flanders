@@ -14,6 +14,8 @@ import (
 
 	"flanders/src/lib/logging"
 	"flanders/src/lib/paths"
+	"flanders/src/lib/state"
+	"flanders/src/lib/task"
 )
 
 // Version is the harness version, bumped on each green build (PROMPT rule:
@@ -53,5 +55,21 @@ func run() error {
 
 	log.Info("flanders starting", "version", Version, "root", p.Root)
 	fmt.Printf("flanders %s (project root: %s)\n", Version, p.Root)
+
+	// Load the run-state cache on startup (spec 09). A missing tasks dir yields an
+	// empty store (the expected pre-plan state); a missing or corrupt state.json is
+	// a cache miss, not an error — LoadOrRebuild reconstructs it from the task store
+	// (ground truth). The fallback phase is `orchestrate`: bare `flanders` drives
+	// plan→build, and the command surface that overrides this lands in Phase 8.
+	store, err := task.LoadDir(p.Tasks)
+	if err != nil {
+		return fmt.Errorf("load tasks: %w", err)
+	}
+	st, rebuilt, err := state.LoadOrRebuild(p.State, store, state.PhaseOrchestrate)
+	if err != nil {
+		return fmt.Errorf("load state: %w", err)
+	}
+	log.Info("run state loaded", "rebuilt", rebuilt, "phase", st.Phase,
+		"run_state", st.RunState, "current_task", st.CurrentTask)
 	return nil
 }

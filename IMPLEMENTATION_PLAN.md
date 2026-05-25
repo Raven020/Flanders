@@ -1,13 +1,14 @@
 # Flanders — Implementation Plan
 
 > **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 in progress — 1.1
-> (Config loader), 1.3 (Task-file model), and 1.4 (Task store / selector)
-> COMPLETE. Go module (`module flanders`, go 1.24), layout (`src/cmd/flanders` +
-> `src/lib/{paths,logging,config,task}`), file-backed slog logger, paths helper,
-> config loader, the task-file model, and the task store/selector all exist with
-> passing tests. `go build ./...`, `go vet ./...`, and `go test ./...` are all
-> green. **Next up: 1.5 State persistence** (consumes the task store for
-> rebuild), then 1.2 (`flanders init`) and 1.6 (Journal writer).
+> (Config loader), 1.3 (Task-file model), 1.4 (Task store / selector), and 1.5
+> (State persistence) COMPLETE. Go module (`module flanders`, go 1.24), layout
+> (`src/cmd/flanders` + `src/lib/{paths,logging,config,task,state}`), file-backed
+> slog logger, paths helper, config loader, the task-file model, the task
+> store/selector, and the state cache (`src/lib/state`, wired into `main` for
+> startup load) all exist with passing tests. `go build ./...`, `go vet ./...`,
+> and `go test ./...` are all green. **Next up: 1.6 Journal writer** (tier-2
+> history; also feeds state rebuild) and 1.2 (`flanders init`).
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -117,10 +118,45 @@
   task non-actionable in `Next` (skipped) but is only surfaced as an error by the
   explicit `Validate()`, so `Next` stays robust on a half-built plan. 13 new tests +
   full suite green.)
-- [ ] **1.5 State persistence** (`state.json`, `09-state-and-resume.md`). Atomic
+- [x] **1.5 State persistence** (`state.json`, `09-state-and-resume.md`). Atomic
   write (temp+rename) on every transition; load on startup; rebuild from task
   files+journal+git when missing/corrupt. *Acceptance:* round-trip; corrupt file
   recovers without crashing.
+  (Implemented in NEW package `src/lib/state` (stdlib `encoding/json` only — NO new
+  external dep). `State` struct mirrors the spec-09 schema exactly (schema_version,
+  phase, run_state, started_at/updated_at, iter{plan,build,total}, current_task,
+  stall{count,n}, usage{waiting,reset_at,cycles_used}, halt{reason,task},
+  last_checkpoint, last_session_id). KEY DESIGN: state.json is a CACHE not a store —
+  missing/corrupt is a cache miss, not an error. Three load outcomes are
+  distinguished so callers react precisely: missing → error wrapping
+  `os.ErrNotExist`; present-but-unreadable (bad JSON OR unknown schema_version) →
+  `*CorruptError`; other I/O error → returned verbatim. `LoadOrRebuild(path, store,
+  fallbackPhase)` is the startup entry point: Load; on missing OR corrupt →
+  `Rebuild` from the task store, returns `rebuilt=true`. `Save` is atomic
+  (temp-in-same-dir + rename, mirrors `task.WriteFile`), MkdirAll's the parent, and
+  stamps `UpdatedAt` to now on every call so "save on every transition" doubles as
+  the TUI heartbeat. `reset_at` is `*time.Time` so null↔backoff round-trips.
+  `Validate()` is STRUCTURAL only (schema==1, phase/run_state enum membership,
+  non-negative counters) — it's the gate Load uses to detect corruption, so
+  cross-field semantics (WAITING⇒usage.waiting) are left to Phase-3 transition
+  helpers, not Validate. `Rebuild` derives the cursor from the ONLY ground-truth
+  tier that exists today (the task store): prefers an `active` task (crash mid-loop)
+  else `Next()`; leaves iter/stall.n/usage ZERO on purpose (config- and
+  journal-derived — honest cache claims only what truth can prove). Wired into
+  `src/cmd/flanders/main.go`: startup does `task.LoadDir(p.Tasks)` →
+  `state.LoadOrRebuild(p.State, store, PhaseOrchestrate)` and logs run_state/phase/
+  current_task. Verified: bare run logs `rebuilt=true phase=orchestrate
+  run_state=RUNNING` (no state.json + no tasks dir = clean cache miss). 9 tests +
+  full suite green.
+  DEFERRED (documented, not stubbed): (a) the RUNNING-crash reconcile-against-git
+  path (spec 09 §resume: re-read git status/diff to decide if an interrupted loop
+  landed work) belongs to Phase 3.5 status-reconciliation — needs git, not built
+  yet; (b) journal-tier rebuild enrichment (iter counts, last_session_id) lands with
+  1.6; (c) Save-on-startup is intentionally NOT done — bare startup has no transition
+  to persist, and persisting a rebuilt snapshot before the orchestrator fills
+  config-derived fields would write a half-derived cache; the orchestrator (Phase 5)
+  owns when to first persist. Schema-migration policy on a future `schema_version`
+  bump = rebuild-from-truth (treat unknown version as corrupt) — OPEN in spec 09.)
 - [ ] **1.6 Journal writer** (`.flanders/journal/`, `01` §journal). Per-loop
   record: raw stream-json + summary (task, files touched, test result, cost,
   tokens, duration, session id). Append-only; readable back for the TUI history.
@@ -303,8 +339,11 @@
 1. **Stream-json contract was undefined** → authored `specs/08-stream-json-protocol.md`
    (draft; wire shapes marked OPEN until pinned vs CLI 2.1.x). *Highest technical
    risk in the project.* See task **2.1–2.3**.
-2. **`state.json` was undefined** → authored `specs/09-state-and-resume.md` (draft).
-   See task **1.5 / 3.12**.
+2. **`state.json`** → authored `specs/09-state-and-resume.md` (draft) and IMPLEMENTED
+   in `src/lib/state` (task 1.5 done). Persistence + recovery (missing/corrupt →
+   rebuild from task store) are complete; the RUNNING-crash git-reconcile path is
+   deferred to Phase 3.5 and journal-tier rebuild to 1.6. The usage-wait/resume
+   *consumer* of this state is still task **3.12**.
 3. **`flanders init` inconsistency** — referenced in `03-config.md` ("missing →
    `flanders init` …") but **absent from the command surface** in `00-overview.md`.
    Reconcile (add `init` to the surface, or fold default-writing into bare run).
@@ -332,7 +371,8 @@
 - Module `flanders`; packages under `src/`, imported as `flanders/src/lib/<pkg>`. Build/test/vet/run commands are in AGENTS.md. First green tag: `0.0.1`.
 - External dependencies: `github.com/BurntSushi/toml v1.4.0` (config parsing, TOML);
   `gopkg.in/yaml.v3 v3.0.1` (task-file frontmatter, YAML — node-based for lossless
-  round-trip). Config is TOML, task files are YAML — both by spec design.
+  round-trip). Config is TOML, task files are YAML — both by spec design. State
+  (`src/lib/state`) uses stdlib `encoding/json` only — no new dependency.
 
 ## Working agreements (from PROMPTs)
 
