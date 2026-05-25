@@ -9,8 +9,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 
@@ -24,7 +26,7 @@ import (
 
 // Version is the harness version, bumped on each green build (PROMPT rule:
 // start at 0.0.0 and increment patch).
-const Version = "0.0.12"
+const Version = "0.0.13"
 
 const usage = `usage: flanders [command]
 
@@ -115,13 +117,23 @@ func runOrchestrate() error {
 	if err != nil {
 		root = cwd
 	}
-	p, err := paths.New(root)
+	// Load config FIRST so every location resolves through it (spec 03 [paths]).
+	// This is the single startup config-load all later phases depend on; without
+	// it the [paths] section was parsed and then ignored (a silent no-op).
+	cfg, err := loadConfigOrDefault(root)
+	if err != nil {
+		return err
+	}
+	p, err := paths.NewFromConfig(root, cfg)
 	if err != nil {
 		return err
 	}
 	if err := p.EnsureFlanders(); err != nil {
 		return err
 	}
+	// Log level is not configurable yet: spec 03 has no [logging] section, so a
+	// config field would be speculative. Left at Info; revisit with the [tui]/
+	// [logging] config-section pass (IMPLEMENTATION_PLAN.md findings 14/15).
 	log, err := logging.New(p.Log, slog.LevelInfo)
 	if err != nil {
 		return err
@@ -162,4 +174,28 @@ func runOrchestrate() error {
 	}
 	log.Info("journal opened", "dir", jrnl.Dir(), "entries", depth)
 	return nil
+}
+
+// loadConfigOrDefault loads .flanders/config.toml from root, falling back to the
+// documented defaults when the file is absent. A missing config is normal before
+// `flanders init`, so a bare `flanders` must still run on defaults; but a config
+// that exists yet fails to parse or validate is a HARD error — the user asked for
+// something specific and we must not silently ignore it and run on defaults.
+//
+// The config file's own location is not configurable, so it is resolved with the
+// default layout (paths.New); only after loading do we build the overlaid Paths.
+func loadConfigOrDefault(root string) (*config.Config, error) {
+	dp, err := paths.New(root)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := config.Load(dp.Config)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			def := config.Default()
+			return &def, nil
+		}
+		return nil, err
+	}
+	return cfg, nil
 }

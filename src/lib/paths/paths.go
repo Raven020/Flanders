@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"flanders/src/lib/config"
 )
 
 // Default locations, relative to the project root. These mirror the [paths]
@@ -44,25 +47,73 @@ type Paths struct {
 }
 
 // New resolves the default layout against root. root is cleaned to an absolute
-// path; every returned field is absolute.
+// path; every returned field is absolute. It is NewFromConfig with no overlay —
+// the right constructor when no config has been loaded yet (e.g. `flanders init`,
+// which writes the default config before any exists to read).
 func New(root string) (*Paths, error) {
+	return NewFromConfig(root, nil)
+}
+
+// NewFromConfig resolves the layout against root, overlaying any non-empty
+// configurable location from cfg onto the documented defaults. This is the
+// single point where spec-03 [paths] (specs/tasks/journal/plan/state) and
+// [agent].rules_file actually take effect: before it existed, paths.New
+// hardcoded the Default* constants and ignored config entirely, so the whole
+// [paths] section was a silent no-op (spec-03 non-compliance). A nil cfg, or
+// empty fields within it, keep the defaults — so absent keys never override.
+//
+// Configurable locations may be relative (resolved against root, the documented
+// shape) or absolute (used as-is). The config file's own location, the diagnostic
+// log, and the .flanders/ working dir are NOT configurable — they are fixed under
+// root so the harness can always find where it loaded its config from.
+func NewFromConfig(root string, cfg *config.Config) (*Paths, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve root %q: %w", root, err)
 	}
-	join := func(rel string) string { return filepath.Join(abs, filepath.FromSlash(rel)) }
+	// resolve turns a config-relative location into an absolute path; an already
+	// absolute location is taken verbatim (a user may point [paths] outside root).
+	resolve := func(loc string) string {
+		if filepath.IsAbs(loc) {
+			return filepath.Clean(loc)
+		}
+		return filepath.Join(abs, filepath.FromSlash(loc))
+	}
+
+	specs, tasks := DefaultSpecs, DefaultTasks
+	journal, plan, state := DefaultJournal, DefaultPlan, DefaultState
+	rules := DefaultRules
+	if cfg != nil {
+		specs = overlay(specs, cfg.Paths.Specs)
+		tasks = overlay(tasks, cfg.Paths.Tasks)
+		journal = overlay(journal, cfg.Paths.Journal)
+		plan = overlay(plan, cfg.Paths.Plan)
+		state = overlay(state, cfg.Paths.State)
+		rules = overlay(rules, cfg.Agent.RulesFile)
+	}
+
 	return &Paths{
 		Root:     abs,
-		Specs:    join(DefaultSpecs),
-		Tasks:    join(DefaultTasks),
-		Journal:  join(DefaultJournal),
-		Plan:     join(DefaultPlan),
-		State:    join(DefaultState),
-		Rules:    join(DefaultRules),
-		Config:   join(DefaultConfig),
-		Log:      join(DefaultLog),
-		Flanders: join(flandersDir),
+		Specs:    resolve(specs),
+		Tasks:    resolve(tasks),
+		Journal:  resolve(journal),
+		Plan:     resolve(plan),
+		State:    resolve(state),
+		Rules:    resolve(rules),
+		Config:   resolve(DefaultConfig),
+		Log:      resolve(DefaultLog),
+		Flanders: resolve(flandersDir),
 	}, nil
+}
+
+// overlay returns val when it carries a non-blank location, else the default.
+// Whitespace-only config values are treated as absent so a stray "  " in the
+// file can't blank out a default location.
+func overlay(def, val string) string {
+	if strings.TrimSpace(val) != "" {
+		return val
+	}
+	return def
 }
 
 // EnsureFlanders creates the .flanders/ directory and its journal subdirectory

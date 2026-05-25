@@ -56,7 +56,9 @@
 >
 > **PROGRESS (2026-05-26):** **2.5 process supervisor DONE** (`src/lib/supervise` — spawn/stream/wait, process-group timeout-kill, stdin injection writer; 12 tests, race-clean) plus **2.6(a)** outbound encoder (`stream.EncodeUserMessage`) and **2.6(b)** reset-epoch regression guard. The Phase-3 loop-engine blocker is cleared. `Version` `0.0.12`, tag `0.0.12`. `go build/vet/test ./...` green.
 >
-> **Next up, in priority order:** (1) **0.5 `[paths]` overlay** — cheap foundational correctness fix; (2) **Phase 3.1 iteration driver** — now unblocked by the supervisor.
+> **PROGRESS (2026-05-26):** **0.5 DONE** — config is now loaded at startup and the `[paths]`/`rules_file` overlay applies via `paths.NewFromConfig` (`runOrchestrate` loads `.flanders/config.toml`, missing → defaults, invalid → hard error). Log level left non-configurable pending a `[logging]` spec section. `Version` `0.0.13`, tag `0.0.13`.
+>
+> **Next up, in priority order:** (1) **Phase 3.1 iteration driver** — now unblocked by the supervisor (2.5), and paths now resolve through config so consumers won't bake in wrong locations.
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -101,7 +103,7 @@
 - [x] **0.4 Paths helper** in `src/lib`: resolve `[paths]` (specs, tasks, journal,
   plan, state) relative to project root; create `.flanders/` on demand.
   (`src/lib/paths`: New/EnsureFlanders/FindRoot; resolves specs/03 [paths] defaults + rules/config/log; creates `.flanders/` on demand)
-- [ ] **0.5 Load config at startup + apply the `[paths]` overlay** `[CONFIRMED GAP
+- [x] **0.5 Load config at startup + apply the `[paths]` overlay** `[CONFIRMED GAP
   — spec-03 non-compliance; code-verified twice]`. Two coupled facts: (a)
   `paths.New(root)` (`src/lib/paths/paths.go:48-66`) hardcodes the `Default*`
   constants and **never consults `config.Paths`**; and (b) — the deeper root cause
@@ -124,6 +126,7 @@
   journal/state/tasks to the configured locations; absent keys keep the defaults;
   startup loads the real config. Do **before** Phase-3 consumers start resolving
   paths so they never bake in the wrong locations. (Low effort, foundational.)
+  (Implemented `paths.NewFromConfig(root string, cfg *config.Config) (*Paths, error)` in `src/lib/paths/paths.go`; `New(root)` now delegates to `NewFromConfig(root, nil)` (defaults-only, used by `flanders init`, which writes the default config before one exists to read). `NewFromConfig` overlays any non-empty `[paths].{specs,tasks,journal,plan,state}` AND `[agent].rules_file` onto the `Default*` constants — closing the same silent-no-op bug for `rules_file` too (the audit only named `[paths]`, but `rules_file` had it as well). Empty/whitespace-only config values keep the default (default-then-overlay contract); absolute config locations are honored verbatim (a user may point outside root), relative ones resolve against root. Config/Log/`.flanders/` are NOT configurable — fixed under root so the harness can always find where it loaded config from. `runOrchestrate` (`src/cmd/flanders/main.go`) now calls `loadConfigOrDefault(root)` FIRST, then `paths.NewFromConfig(root, cfg)`. `loadConfigOrDefault`: loads `.flanders/config.toml` (path resolved via the default layout, since the config file's own location isn't configurable); a MISSING file falls back to `config.Default()` (bare `flanders` before `init` must still run); a present-but-INVALID config is a HARD error (never silently run on defaults when the user asked for something specific). Uses `errors.Is(err, fs.ErrNotExist)` — works because `config.Load` wraps the not-exist error with `%w`. DECISION on the log level (plan item 0.5 part 3): left at `slog.LevelInfo`, NOT made configurable — spec 03 has no `[logging]` section, so adding a config field would be speculative spec-extension; deferred to the dedicated `[tui]`/`[logging]` config-section pass (findings 14/15). A code comment at the logger-init site documents this. Tests: `src/lib/paths/paths_test.go` adds TestNewFromConfigOverlaysPaths, TestNewFromConfigEmptyKeepsDefaults, TestNewFromConfigAbsolutePath, TestNewFromConfigNilMatchesNew; `src/cmd/flanders/main_test.go` adds TestLoadConfigOrDefaultMissing/Present/Invalid. End-to-end smoke test verified: a config with `journal = "logs/loops"` makes the running binary create+use `logs/loops` instead of `.flanders/journal`. `go build/vet/test ./...` all green, race-clean. Version bumped to 0.0.13.)
 
 ## Phase 1 — Config & data model (`src/lib` core)  `[depends: 0]`
 
@@ -789,11 +792,14 @@
 
 ### Audit re-run 2026-05-25 — new confirmed findings
 
-9. **`[paths]` config is a silent no-op** `[CONFIRMED, code-verified]`.
+9. **`[paths]` config is a silent no-op** `[RESOLVED — task 0.5]`.
    `paths.New(root)` (`src/lib/paths/paths.go:48-66`) always uses the hardcoded
    `Default*` constants; nothing overlays `config.Paths` (parsed + validated by
    `src/lib/config`). A user's `[paths]` section is therefore ignored — spec-03
-   non-compliance. → **task 0.5** (highest-priority correction; cheap).
+   non-compliance. → **task 0.5** (highest-priority correction; cheap). **FIXED by 0.5**:
+   `paths.NewFromConfig` overlays the configured `[paths]` (and also fixed the parallel
+   `[agent].rules_file` no-op, which had the same bug), and `runOrchestrate` loads the
+   config at startup.
 10. **Stream decoder drops spec-documented fields** (all non-blocking, → task 2.6):
     `ResultEvent` lacks `duration_api_ms`/`ttft_ms`; `ModelUsage` lacks
     `webSearchRequests`; the `user` wire's `tool_use_result` sibling
@@ -819,9 +825,13 @@
     before 6.1 (→ noted on 6.1). Per-role override keys remain spec-OPEN.
 15. **Logging: no `[logging]` section / level not config-wired; no rotation.** The
     `logging.ParseLevel` helper exists but nothing maps a config field to it (level
-    is hardcoded at `runOrchestrate`). Rotation is deferred-by-design (task 0.3
+    is hardcoded at `runOrchestrate`). **The level-not-config-wired part is now a
+    DELIBERATE deferral decided in 0.5**: spec 03 has no `[logging]` section, so wiring
+    a level field would be speculative spec-extension — left hardcoded (`slog.LevelInfo`)
+    until a `[logging]` section is specced; the concern is documented at the logger-init
+    code site. Rotation is deferred-by-design (task 0.3
     note) — fine for now, revisit for multi-day unattended runs. Minor; fold into
-    the 0.5/`[tui]` config-section work or a later config pass.
+    the `[tui]` config-section work or a later config pass.
 16. **Small task-model gaps** (→ task 1.7): `id`↔filename-prefix not validated at
     load; `attempts` has no typed accessor/setter; no `SetNotes`/`SetFiles`. All
     minor / partly spec-OPEN; close against the Phase-3/4 consumers that need them.

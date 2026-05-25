@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -51,6 +52,54 @@ func TestInitAtWritesLoadableConfig(t *testing.T) {
 	}
 	if err := cfg.ValidateForBuild(); err != nil {
 		t.Errorf("init'd config failed ValidateForBuild: %v", err)
+	}
+}
+
+// loadConfigOrDefault must fall back to documented defaults when no config file
+// exists — a bare `flanders` before `init` has to run on defaults, not error.
+func TestLoadConfigOrDefaultMissing(t *testing.T) {
+	root := t.TempDir() // no .flanders/config.toml
+	cfg, err := loadConfigOrDefault(root)
+	if err != nil {
+		t.Fatalf("loadConfigOrDefault on missing config: %v", err)
+	}
+	if cfg.Paths.Specs != "specs" || cfg.Agent.Bin != "claude" {
+		t.Errorf("missing config did not fall back to Default(): %+v", cfg.Paths)
+	}
+}
+
+// loadConfigOrDefault must load a present config and honor its overlaid values,
+// so the [paths] section a user wrote actually reaches startup.
+func TestLoadConfigOrDefaultPresent(t *testing.T) {
+	root := t.TempDir()
+	if err := initAt(root, &bytes.Buffer{}); err != nil {
+		t.Fatalf("initAt: %v", err)
+	}
+	cfg, err := loadConfigOrDefault(root)
+	if err != nil {
+		t.Fatalf("loadConfigOrDefault on present config: %v", err)
+	}
+	// The init'd config sets the Go starter test command; defaults leave it empty.
+	if cfg.Commands.Test == "" {
+		t.Errorf("present config not loaded: Commands.Test empty, want the init starter")
+	}
+}
+
+// A present-but-invalid config is a HARD error: the user asked for something we
+// cannot honor, so we must not silently fall back to defaults.
+func TestLoadConfigOrDefaultInvalid(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".flanders")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// guardrails.stall_n = 0 violates Validate (must be >= 1).
+	bad := "[guardrails]\nstall_n = 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfigOrDefault(root); err == nil {
+		t.Error("loadConfigOrDefault on an invalid config returned no error")
 	}
 }
 
