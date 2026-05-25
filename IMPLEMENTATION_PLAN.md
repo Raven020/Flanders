@@ -1,9 +1,12 @@
 # Flanders — Implementation Plan
 
-> **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 begun — 1.1 (Config loader) COMPLETE. Go module (`module flanders`,
-> go 1.24), layout (`src/cmd/flanders` + `src/lib/{paths,logging}`), file-backed
-> slog logger, and paths helper all exist with passing tests; first tag `0.0.1` cut.
-> `go build ./...`, `go vet ./...`, and `go test ./...` are all green.
+> **Status:** Phase 0 (project foundation) COMPLETE; Phase 1 in progress — 1.1
+> (Config loader) and 1.3 (Task-file model) COMPLETE. Go module (`module flanders`,
+> go 1.24), layout (`src/cmd/flanders` + `src/lib/{paths,logging,config,task}`),
+> file-backed slog logger, paths helper, config loader, and the task-file model all
+> exist with passing tests. `go build ./...`, `go vet ./...`, and `go test ./...`
+> are all green. **Next up: 1.4 Task store / selector** (now unblocked — it
+> consumes `src/lib/task`), then 1.2/1.5/1.6.
 >
 > **Goal:** build **Flanders** — a single Go (1.24+) binary that wraps the
 > `claude` CLI and drives a Ralph loop, per `specs/00`–`09`.
@@ -62,12 +65,29 @@
   *(Note: `init` is referenced in `03-config.md` but absent from the command
   surface in `00-overview.md` — see Findings.)* *Acceptance:* `init` produces a
   loadable, commented config.
-- [ ] **1.3 Task-file model** in `src/lib`. Parse/serialize **YAML frontmatter +
+- [x] **1.3 Task-file model** in `src/lib`. Parse/serialize **YAML frontmatter +
   markdown body**: `id`, `status` (pending|active|done|blocked), `reason`
   (required iff blocked; taxonomy `context-overreach|new-scope|dependency|error`),
   `deps[]`, `acceptance`, optional `notes`/`files`/`attempts`. Round-trips without
   losing body or unknown fields. *Acceptance:* parse→serialize is lossless;
   blocked-without-reason rejected. (`02-plan-and-tasks.md`)
+  (Implemented in `src/lib/task` (package `task`). KEY DESIGN: the frontmatter is
+  held as a `gopkg.in/yaml.v3` `yaml.Node` (the single source of truth), NOT a
+  plain struct — this is what makes the round-trip truly lossless: unknown keys,
+  key order, AND inline comments all survive parse→serialize (a struct decode
+  would drop all three). Typed accessors (`ID/Status/Reason/Deps/Acceptance/
+  Notes/Files`) and setters (`SetStatus/SetBlocked/SetDeps`) are a thin view over
+  the node, so there is no struct↔node drift. `id` and `deps` are read verbatim,
+  so zero-padding like `0007`/`0001` is preserved (selector 1.4 must normalize ids
+  when matching deps→ids). INVARIANT: `SetStatus` to any non-blocked status auto-
+  clears `reason`, and `SetBlocked(reason)` is the only way to reach a blocked
+  state — so "reason iff blocked" is hard to violate by construction, not just
+  caught at `Validate`. `Validate()` requires id+acceptance+valid-status and
+  enforces reason↔blocked. Frontmatter split: the closing `---` is the FIRST `---`
+  line after the opener, so a markdown horizontal-rule `---` in the body is not
+  mistaken for it; CRLF and a leading BOM are tolerated. `WriteFile` is atomic
+  (temp-in-same-dir + rename). NEW DEP: `gopkg.in/yaml.v3 v3.0.1` (task files are
+  YAML by design; config stays TOML). All task tests + full suite green.)
 - [ ] **1.4 Task store / selector.** Enumerate `specs/tasks/*.md`; select the next
   actionable task = `pending` with **all `deps` `done`**; never select a task with
   unmet deps. Detect dependency cycles. *Acceptance:* selector returns correct
@@ -285,7 +305,9 @@
 ## Build conventions
 
 - Module `flanders`; packages under `src/`, imported as `flanders/src/lib/<pkg>`. Build/test/vet/run commands are in AGENTS.md. First green tag: `0.0.1`.
-- First external dependency: `github.com/BurntSushi/toml v1.4.0` (config parsing); `go.sum` now exists.
+- External dependencies: `github.com/BurntSushi/toml v1.4.0` (config parsing, TOML);
+  `gopkg.in/yaml.v3 v3.0.1` (task-file frontmatter, YAML — node-based for lossless
+  round-trip). Config is TOML, task files are YAML — both by spec design.
 
 ## Working agreements (from PROMPTs)
 
