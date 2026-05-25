@@ -24,6 +24,17 @@ go vet ./...                  # static checks
 go run ./src/cmd/flanders     # run the binary
 ```
 
+## Stream-json fixtures
+
+`src/lib/stream/testdata/*.jsonl` are real `claude 2.1.x` transcripts (the parser
+contract). Regenerate one with:
+
+```sh
+claude -p "<prompt>" --output-format stream-json --verbose --include-partial-messages --dangerously-skip-permissions
+```
+
+(`jq` is not installed here; inspect transcripts with `python3 -c` instead.)
+
 ## Runtime
 
 - `.flanders/` (gitignored) holds runtime state: `journal/`, `state.json`,
