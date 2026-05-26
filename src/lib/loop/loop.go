@@ -42,9 +42,14 @@
 // done-detection (plan task 3.7). The checkpoint step (7, checkpoint.go) commits the
 // loop's work on progress per [git].commit_each (spec 01 §Checkpointing) and surfaces
 // the new commit sha on Result for the orchestrator to persist as state.last_checkpoint
-// (spec 09); it does NOT touch state.json itself. What this package still defers (each
-// its own plan item, wired into the same Iterate spine when it lands): the
-// context/stall/usage guardrails (3.8–3.12). The prompt composition
+// (spec 09); it does NOT touch state.json itself. The context-pressure guardrail
+// (context_pressure.go, plan task 3.11) is wired into the spawn/observe steps: a per-loop
+// guard drives a live occupancy tracker off the supervisor's OnEvent hook and, on a trip,
+// injects a graceful wind-down (~soft_pct, when stream_input is on) or hard-kills and
+// writes `blocked: context-overreach` itself (~hard_pct, the harness owning the marker).
+// What this package still defers (each its own plan item, wired into the same Iterate
+// spine when it lands): the per-iteration-timeout and usage-limit guardrails (3.10, 3.12),
+// and the stall/max-iteration accounting the orchestrator owns (3.8–3.9). The prompt composition
 // (compose.go) is the full cost/quality lever (plan task 3.2): the current task file
 // + the outcomes of its dependencies + only the spec excerpts it references + a
 // one-line plan summary, with the loop rules appended as a system prompt. None of
@@ -186,6 +191,14 @@ type Result struct {
 	// a non-repo target the run is not permitted to init. The orchestrator persists a
 	// non-empty value to state.last_checkpoint (spec 09).
 	Checkpoint string
+
+	// ContextTrip is the highest context-pressure tier the loop reached (spec 01
+	// §context-pressure, plan task 3.11): TripNone (stayed under soft_pct), TripSoft (a
+	// graceful wind-down was steered at soft_pct), or TripHard (the harness hard-killed at
+	// hard_pct and wrote `blocked: context-overreach` itself — Reconcile then reflects that
+	// terminal status). The orchestrator/TUI read it to surface why a loop ended and to
+	// route an over-large task to a fresh split pass.
+	ContextTrip stream.Trip
 }
 
 // Iterate runs one Ralph loop in the given phase (build|plan|test|split — the
@@ -256,6 +269,12 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 	// Best-effort: a non-repo target yields an inert snapshot and no signal.
 	pre := git.Snap(ctx, d.paths.Root)
 
+	// Context-pressure guardrail (plan task 3.11): a per-loop guard drives a live
+	// occupancy tracker off every decoded event (the supervisor's OnEvent hook) and, on
+	// a trip, steers the running process — inject a graceful wind-down at soft_pct (when
+	// stream_input is on) and hard-kill at hard_pct. *supervise.Proc satisfies the guard's
+	// procController, so the hook hands it the live process to act on (see context_pressure.go).
+	guard := newContextGuard(d.cfg, d.log)
 	var raw bytes.Buffer
 	res, err := d.run(ctx, supervise.Spec{
 		Command:     cmd,
@@ -263,6 +282,7 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 		StreamInput: d.cfg.Agent.StreamInput,
 		Timeout:     d.cfg.Guardrails.IterationTimeout.Duration,
 		RawSink:     &raw,
+		OnEvent:     func(p *supervise.Proc, ev *stream.Event) { guard.handle(p, ev) },
 		Log:         d.log,
 	})
 	if err != nil {
@@ -304,6 +324,19 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 	// rewriting an unreadable file — the journal then records the pre-loop status.
 	workHappened, files := git.Diff(pre, git.Snap(ctx, d.paths.Root))
 
+	// Context-pressure tier 3 (plan task 3.11): when the harness hard-killed this loop, it
+	// OWNS recording the outcome — the agent never reached its own status flip. Write
+	// `blocked: context-overreach` (plus a git-diff handoff of the partial progress above)
+	// to the task file HERE, before the reconcile reload, so reconciliation sees the
+	// terminal status and respects it on the normal agent-status-first path. The handoff
+	// uses `files` (computed before this write), so the harness's own marker edit is not
+	// counted as the loop's work; the checkpoint step then commits the marker + partial work.
+	if guard.hardKilled() {
+		if werr := d.markContextOverreach(t, files); werr != nil {
+			d.log.Warn("context-pressure: writing block marker failed", "task", t.ID(), "err", werr)
+		}
+	}
+
 	after := t
 	var rec reconcile.Result
 	if reloaded, rerr := task.ParseFile(t.Path); rerr == nil {
@@ -322,6 +355,12 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 
 	class, _ := d.cfg.PhaseClass(phase) // phase already validated by invoke.Build above
 	sum := d.buildSummary(phase, t, after, sid, class, res, obs, start, outcome, vr, files)
+	// A context-pressure hard kill (plan task 3.11) reads as a generic process error to
+	// Classify (killed mid-stream, no result), so name it precisely in the journal — the
+	// history must show the loop ended on the backstop, not on an opaque agent crash.
+	if guard.hardKilled() {
+		sum.Error = "context-pressure hard backstop (≥ context.hard_pct): harness ended the loop and marked it blocked: context-overreach"
+	}
 	seq, err := d.journal.Append(sum, &raw)
 	if err != nil {
 		return nil, fmt.Errorf("loop: journal task %s: %w", t.ID(), err)
@@ -339,7 +378,8 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 		"outcome", outcome.String(), "exit", res.ExitCode,
 		"timed_out", res.TimedOut, "journal_seq", seq,
 		"status_after", sum.StatusAfter, "reconcile", rec.Action, "work_happened", workHappened,
-		"test_passed", sum.Test.Passed(), "checkpoint", checkpointSHA, "cost_usd", obs.Cost)
+		"test_passed", sum.Test.Passed(), "checkpoint", checkpointSHA,
+		"context_trip", guard.peakTrip().String(), "cost_usd", obs.Cost)
 
 	return &Result{
 		Phase:        phase,
@@ -356,6 +396,7 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 		WorkHappened: workHappened,
 		FilesTouched: files,
 		Checkpoint:   checkpointSHA,
+		ContextTrip:  guard.peakTrip(),
 	}, nil
 }
 

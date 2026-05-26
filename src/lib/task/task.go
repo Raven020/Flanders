@@ -236,6 +236,19 @@ func (t *Task) SetBlocked(r Reason) {
 	t.setStrScalar(keyReason, string(r))
 }
 
+// SetNotes sets the optional `notes` field — the free-form handoff text the harness
+// writes when it ends a loop itself (the context-pressure backstop writes a partial-
+// progress summary here, spec 01 §context-pressure) and the plan/split passes read.
+// An empty/whitespace-only value removes the key rather than leaving an empty scalar,
+// so "no notes" round-trips as absence (the spec leaves `notes` optional, spec 02).
+func (t *Task) SetNotes(notes string) {
+	if strings.TrimSpace(notes) == "" {
+		t.removeKey(keyNotes)
+		return
+	}
+	t.setStrScalar(keyNotes, notes)
+}
+
 // SetDeps replaces the deps list (flow-style numeric scalars, like the spec
 // example). Empty/nil renders as `[]`.
 func (t *Task) SetDeps(deps []string) {
