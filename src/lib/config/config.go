@@ -391,9 +391,8 @@ func (c *Config) ValidateForBuild() error {
 // time instead of silently running the wrong model.
 //
 // Subagent-class resolution (the [subagents] default + per-class override merge)
-// is intentionally NOT here — the harness only ever invokes phase (lead) agents;
-// subagents are spawned by the lead inside its own session. That resolver lands
-// with the agent-class work that needs it (plan task 4.1).
+// is a separate concern — the harness only ever invokes phase (lead) agents;
+// subagents are spawned by the lead inside its own session. See SubagentClass.
 func (c *Config) PhaseClass(phase string) (AgentClass, error) {
 	switch phase {
 	case "discuss":
@@ -409,6 +408,32 @@ func (c *Config) PhaseClass(phase string) (AgentClass, error) {
 	default:
 		return AgentClass{}, fmt.Errorf("unknown phase %q (want discuss|plan|build|test|split)", phase)
 	}
+}
+
+// SubagentClass resolves the model+effort for a subagent class by name, the
+// single source of truth for subagent-class resolution (spec 07). It is the
+// companion to PhaseClass for the lighter agents a lead spins up inside its own
+// session: it starts from the global [subagents] default (sonnet/low) and overlays
+// any [subagents.<name>] override.
+//
+// Two deliberate differences from PhaseClass: (1) an unknown name is NOT an error
+// — subagent class names are open-ended (a lead may spawn any-named helper), so a
+// name with no [subagents.<name>] table simply resolves to the global default;
+// (2) overrides are merged field-by-field, not wholesale — a table that sets only
+// `model` (or only `effort`) keeps the global default for the field it omits, so a
+// partial override never blanks a field to "" (mirrors agentClassFromMap, which
+// leaves an unset field empty).
+func (c *Config) SubagentClass(name string) AgentClass {
+	class := AgentClass{Model: c.Subagents.Model, Effort: c.Subagents.Effort}
+	if override, ok := c.Subagents.Classes[name]; ok {
+		if override.Model != "" {
+			class.Model = override.Model
+		}
+		if override.Effort != "" {
+			class.Effort = override.Effort
+		}
+	}
+	return class
 }
 
 func validateEffort(field, value string) error {

@@ -324,3 +324,59 @@ func TestPhaseClass(t *testing.T) {
 		t.Error("expected error for unknown phase")
 	}
 }
+
+func TestSubagentClass(t *testing.T) {
+	// Default config has no per-class overrides: every name resolves to the
+	// global [subagents] default, and unknown names never error.
+	d := Default()
+	for _, name := range []string{"explore", "review", "anything"} {
+		got := d.SubagentClass(name)
+		if got.Model != "sonnet" || got.Effort != "low" {
+			t.Errorf("default SubagentClass(%q) = %s/%s, want sonnet/low", name, got.Model, got.Effort)
+		}
+	}
+
+	// A loaded config with overrides merges them onto the default.
+	cfg, err := Load(writeConfig(t, fullSample))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	// fullSample defines [subagents.explore] model=haiku, effort=low (full override).
+	if got := cfg.SubagentClass("explore"); got.Model != "haiku" || got.Effort != "low" {
+		t.Errorf("SubagentClass(explore) = %s/%s, want haiku/low", got.Model, got.Effort)
+	}
+	// An unconfigured name still falls back to the global default.
+	if got := cfg.SubagentClass("unconfigured"); got.Model != "sonnet" || got.Effort != "low" {
+		t.Errorf("SubagentClass(unconfigured) = %s/%s, want sonnet/low", got.Model, got.Effort)
+	}
+}
+
+// TestSubagentClassPartialOverride locks the field-by-field merge: an override
+// that sets only one field must keep the global default for the other, never
+// blank it to "".
+func TestSubagentClassPartialOverride(t *testing.T) {
+	const partial = `
+[commands]
+test = "go test ./..."
+
+[subagents]
+model  = "sonnet"
+effort = "low"
+
+[subagents.modelonly]
+model = "opus"
+
+[subagents.effortonly]
+effort = "high"
+`
+	cfg, err := Load(writeConfig(t, partial))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.SubagentClass("modelonly"); got.Model != "opus" || got.Effort != "low" {
+		t.Errorf("SubagentClass(modelonly) = %s/%s, want opus/low (effort kept from default)", got.Model, got.Effort)
+	}
+	if got := cfg.SubagentClass("effortonly"); got.Model != "sonnet" || got.Effort != "high" {
+		t.Errorf("SubagentClass(effortonly) = %s/%s, want sonnet/high (model kept from default)", got.Model, got.Effort)
+	}
+}
