@@ -199,6 +199,15 @@ type Result struct {
 	// terminal status). The orchestrator/TUI read it to surface why a loop ended and to
 	// route an over-large task to a fresh split pass.
 	ContextTrip stream.Trip
+
+	// PlanComplete is the plan-completeness coverage verdict (plan task 4.3, spec 06
+	// §Plan-completeness criterion) — set only by PlanIterate (nil for a task loop). It
+	// is the plan-phase loop-exit signal: the orchestrator runs plan loops until
+	// PlanComplete.Complete() holds, feeding PlanComplete.Uncovered into the next focused
+	// re-plan. It is filled best-effort after the loop's work is recorded, so a scan
+	// error (e.g. the agent wrote a malformed task file) leaves it nil without failing
+	// the already-journaled loop — the caller can re-run Driver.PlanComplete itself.
+	PlanComplete *Coverage
 }
 
 // Iterate runs one Ralph loop in the given phase (build|plan|test|split — the

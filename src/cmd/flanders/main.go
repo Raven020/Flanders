@@ -27,7 +27,7 @@ import (
 
 // Version is the harness version, bumped on each green build (PROMPT rule:
 // start at 0.0.0 and increment patch).
-const Version = "0.0.24"
+const Version = "0.0.25"
 
 const usage = `usage: flanders [command]
 

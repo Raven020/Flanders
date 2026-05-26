@@ -132,6 +132,19 @@ func (d *Driver) PlanIterate(ctx context.Context, iter int) (*Result, error) {
 	// not a status flip; planCheckpoint passes it through to the shared commit core.
 	checkpointSHA := d.planCheckpoint(ctx, phase, iter, workHappened)
 
+	// EVALUATE — the plan loop's exit condition is plan-completeness, not a test gate
+	// (plan task 4.3, spec 06 §Plan-completeness criterion). Run the coverage scan over
+	// the task files this loop just wrote so the returned Result tells the orchestrator
+	// whether to spin another plan loop or move to build. Best-effort: the loop's work is
+	// already journaled and committed above, so a scan error (e.g. the agent left a
+	// malformed task file) is logged and leaves PlanComplete nil rather than discarding a
+	// recorded loop — the orchestrator can re-run d.PlanComplete() to decide.
+	cov, cerr := d.PlanComplete()
+	if cerr != nil {
+		d.log.Warn("plan-completeness scan failed", "err", cerr)
+		cov = nil
+	}
+
 	d.log.Info("plan iteration complete",
 		"phase", phase, "session", sid,
 		"outcome", outcome.String(), "exit", res.ExitCode,
@@ -153,6 +166,7 @@ func (d *Driver) PlanIterate(ctx context.Context, iter int) (*Result, error) {
 		FilesTouched: files,
 		Checkpoint:   checkpointSHA,
 		ContextTrip:  guard.peakTrip(),
+		PlanComplete: cov,
 	}, nil
 }
 
