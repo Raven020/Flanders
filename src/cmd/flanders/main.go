@@ -2,23 +2,29 @@
 // is provably complete (all tasks done, real tests green). See specs/00-overview.md.
 //
 // Today the command surface is: `flanders init` (write a commented default
-// config) and the bare invocation (the orchestrate startup: locate the project
-// root, ensure .flanders/, load the run-state cache and journal). The remaining
-// surface (discuss|plan|build, and the orchestrate loop itself) lands in later
-// phases — see IMPLEMENTATION_PLAN.md.
+// config) and the bare invocation (the orchestrate run: locate the project root,
+// ensure .flanders/, load the run-state cache and journal, then drive the
+// plan→build pipeline to completion via src/lib/orchestrate). The remaining surface
+// (discuss|plan|build sub-commands) lands in later phases — see IMPLEMENTATION_PLAN.md.
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"flanders/src/lib/config"
 	"flanders/src/lib/journal"
 	"flanders/src/lib/logging"
+	"flanders/src/lib/loop"
+	"flanders/src/lib/orchestrate"
 	"flanders/src/lib/paths"
 	"flanders/src/lib/rules"
 	"flanders/src/lib/state"
@@ -27,7 +33,7 @@ import (
 
 // Version is the harness version, bumped on each green build (PROMPT rule:
 // start at 0.0.0 and increment patch).
-const Version = "0.0.27"
+const Version = "0.0.28"
 
 const usage = `usage: flanders [command]
 
@@ -188,7 +194,64 @@ func runOrchestrate() error {
 		return fmt.Errorf("read journal: %w", err)
 	}
 	log.Info("journal opened", "dir", jrnl.Dir(), "entries", depth)
+
+	// Build the loop engine and the orchestrator, then run the full plan→build
+	// pipeline (spec 06). The orchestrator owns the run-state machine and persists
+	// state.json at every transition, so a Ctrl-C (ctx cancel) is a graceful stop the
+	// next run resumes from — not a crash.
+	drv, err := loop.New(loop.Options{Config: cfg, Paths: p, Journal: jrnl, Log: log.Logger})
+	if err != nil {
+		return fmt.Errorf("build loop driver: %w", err)
+	}
+	orch, err := orchestrate.New(orchestrate.Options{
+		Driver:    drv,
+		Config:    cfg,
+		Paths:     p,
+		State:     st,
+		StatePath: p.State,
+		Log:       log.Logger,
+	})
+	if err != nil {
+		return fmt.Errorf("build orchestrator: %w", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	sum, err := orch.Run(ctx)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Println("flanders: interrupted — state saved; re-run to resume.")
+			log.Info("run interrupted; state persisted for resume")
+			return nil
+		}
+		return fmt.Errorf("orchestrate: %w", err)
+	}
+	printSummary(sum)
+	log.Info("run finished", "run_state", sum.RunState, "tasks_done", sum.TasksDone,
+		"plan_iters", sum.PlanIters, "build_iters", sum.BuildIters)
 	return nil
+}
+
+// printSummary writes the terminal report (spec 06 §Termination & handoff) to stdout.
+func printSummary(s *orchestrate.Summary) {
+	switch s.RunState {
+	case state.StateDone:
+		fmt.Println("\nflanders: ✓ DONE — all tasks complete and the test gate is green.")
+	case state.StateHalted:
+		fmt.Printf("\nflanders: ⚠ HALTED — %s\n", s.HaltReason)
+		if s.HaltTask != "" {
+			fmt.Printf("          (task %s)\n", s.HaltTask)
+		}
+	default:
+		fmt.Printf("\nflanders: run ended in state %s\n", s.RunState)
+	}
+	fmt.Printf("  tasks: %d done", s.TasksDone)
+	if s.TasksBlocked > 0 {
+		fmt.Printf(", %d blocked", s.TasksBlocked)
+	}
+	fmt.Printf("\n  iterations: %d plan + %d build = %d total\n", s.PlanIters, s.BuildIters, s.TotalIters)
+	fmt.Printf("  duration: %s · cost: $%.4f\n", s.Duration.Round(time.Second), s.CostUSD)
 }
 
 // loadConfigOrDefault loads .flanders/config.toml from root, falling back to the
