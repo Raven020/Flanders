@@ -50,6 +50,20 @@ build agent cannot weaken its own success criterion. This is what makes the
 harness's ground-truth test gate trustworthy. (OPEN: a `tdd=false` escape hatch
 if ever wanted — currently always-on.)
 
+**Red/green determination (locked).** The harness decides the per-task branch by
+combining the signal each side owns: the test agent's **status flip** (it alone
+knows which test covers the acceptance — branch 2 is an explicit `status: done`,
+branches 1 & 3 leave it `pending`) and the harness's **whole-suite test gate** (the
+ground-truth red/green signal). Because the per-task flow runs test → build →
+verify with the suite green before each test loop (every prior task is `done` and
+passing), a freshly **red** suite after the test loop reliably means *this* task's
+acceptance test is red → build it; a still-**green** suite means the agent either
+confirmed satisfaction (`done`) or produced no red test. The harness never *skips*
+build on an unconfirmed `done` (agent says satisfied but the suite is not green): it
+conservatively proceeds to build, where green is established for real. A finer
+**per-task filtered gate** (run only this task's test) is a future refinement; the
+whole-suite gate is the v1 floor.
+
 ## Per-task flow within the build phase
 
 ```
@@ -75,5 +89,6 @@ status. Carry into `04-tui.md`.
 
 - `tdd=false` escape hatch.
 - Whether subagents need per-class overrides beyond the global default in v1.
-- How the test agent locates "an existing test for this acceptance" (heuristic /
-  naming convention / ask the test command to run a filtered subset).
+- ~~How the test agent locates "an existing test for this acceptance"~~ — RESOLVED
+  (see *Red/green determination* above): agent status flip + whole-suite gate, with
+  a per-task filtered gate left as a future refinement.

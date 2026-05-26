@@ -200,6 +200,13 @@ type Result struct {
 	// route an over-large task to a fresh split pass.
 	ContextTrip stream.Trip
 
+	// TestVerdict is the TDD test-phase routing decision (plan task 4.4, spec 07 §test
+	// agent) — set only when Iterate ran the "test" phase to a clean completion (TestVerdictNone
+	// otherwise). It tells the per-task build flow (4.5) whether the acceptance is already
+	// satisfied (skip build), a red acceptance test is ready (proceed to build), no red test
+	// was produced (re-run the test loop), or the task was blocked. See testphase.go.
+	TestVerdict TestVerdict
+
 	// PlanComplete is the plan-completeness coverage verdict (plan task 4.3, spec 06
 	// §Plan-completeness criterion) — set only by PlanIterate (nil for a task loop). It
 	// is the plan-phase loop-exit signal: the orchestrator runs plan loops until
@@ -224,6 +231,13 @@ type Result struct {
 // a timeout) is NOT an error here: it completes normally with Result.Outcome set,
 // because that is a routine, recordable outcome the guardrails act on, not a
 // harness fault.
+//
+// The "test" phase runs the same spine but as the TDD test agent (plan task 4.4, spec 07
+// §test agent): compose uses the test-agent role (taskRoleHeader), a green gate does NOT
+// auto-promote the task to done (it could mean "no test covers this yet"), and the
+// post-loop evaluation sets Result.TestVerdict so the per-task build flow knows whether to
+// skip build (already satisfied), proceed to build (a red acceptance test is ready),
+// re-run the test loop (no red test produced), or drain (blocked). See testphase.go.
 func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, error) {
 	start := d.now()
 
@@ -248,7 +262,7 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 	// referenced spec excerpts + one-line plan summary), plus the loop rules appended
 	// as a system prompt (readRules: the project's .flanders/rules.md, or the built-in
 	// default when that file is absent — the rules are always in force).
-	prompt, err := d.composePrompt(t, store)
+	prompt, err := d.composePrompt(t, store, phase)
 	if err != nil {
 		return nil, fmt.Errorf("loop: compose prompt for task %s: %w", t.ID(), err)
 	}
@@ -350,9 +364,15 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 	var rec reconcile.Result
 	if reloaded, rerr := task.ParseFile(t.Path); rerr == nil {
 		after = reloaded
+		// Promote-on-green is suppressed for the TEST phase. In the build phase a passing
+		// gate proves the task done — a red acceptance test preceded it (the TDD invariant),
+		// so green genuinely means the acceptance is met, and the harness records a forgotten
+		// flip. In the test phase a green suite must NOT promote: it can mean "no test covers
+		// this acceptance yet" (the NoRedTest case), so only the test agent's explicit,
+		// gate-corroborated `done` marks satisfaction — derived in the test-phase verdict below.
 		rec, err = reconcile.Reconcile(after, reconcile.Signals{
 			TestRan:    vr != nil && vr.Test.Ran,
-			TestPassed: vr != nil && vr.Passed(),
+			TestPassed: vr != nil && vr.Passed() && phase != "test",
 		})
 		if err != nil {
 			return nil, fmt.Errorf("loop: reconcile task %s: %w", t.ID(), err)
@@ -360,6 +380,32 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 	} else {
 		d.log.Warn("reconcile skipped: task file unreadable after loop", "task", t.ID(), "err", rerr)
 		rec = reconcile.Result{Action: reconcile.ActionUnchanged, From: t.Status(), To: t.Status()}
+	}
+
+	// TEST PHASE verdict (plan task 4.4, spec 07 §test agent). A test loop's outcome is not
+	// "did the suite pass" but "is there a red acceptance test to build against, or is the
+	// task already satisfied" — derive that routing decision from the reconciled status and
+	// the ground-truth gate (classifyTestVerdict). The orchestrator (4.5) reads
+	// Result.TestVerdict to skip or run the build loop. Computed only on a cleanly-completed
+	// test loop; a non-success outcome is the orchestrator's guardrail path (Result.Outcome).
+	var verdict TestVerdict
+	if phase == "test" && outcome == stream.OutcomeSuccess {
+		gateRan := vr != nil && vr.Test.Ran
+		gatePassed := vr != nil && vr.Passed()
+		verdict = classifyTestVerdict(after.Status(), gateRan, gatePassed)
+		if verdict == TestVerdictRedReady && after.Status() == task.StatusDone {
+			// Ground-truth correction (spec 00 decision 2): the test agent reported the
+			// acceptance already satisfied (status done), but the harness gate did not pass, so
+			// the claim is unconfirmed. Demote to pending so the build loop selects the task and
+			// establishes green for real, rather than skipping build on an unverified done.
+			after.SetStatus(task.StatusPending)
+			if werr := after.WriteFile(""); werr != nil {
+				return nil, fmt.Errorf("loop: correct unconfirmed test-phase done for task %s: %w", t.ID(), werr)
+			}
+			rec = reconcile.Result{Action: reconcile.ActionNormalized, From: rec.From, To: task.StatusPending, Wrote: true}
+			d.log.Warn("test phase: agent reported satisfied but gate not green — proceeding to build",
+				"task", t.ID(), "gate_exit", vr.Test.ExitCode)
+		}
 	}
 
 	class, _ := d.cfg.PhaseClass(phase) // phase already validated by invoke.Build above
@@ -387,7 +433,7 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 		"outcome", outcome.String(), "exit", res.ExitCode,
 		"timed_out", res.TimedOut, "journal_seq", seq,
 		"status_after", sum.StatusAfter, "reconcile", rec.Action, "work_happened", workHappened,
-		"test_passed", sum.Test.Passed(), "checkpoint", checkpointSHA,
+		"test_passed", sum.Test.Passed(), "test_verdict", string(verdict), "checkpoint", checkpointSHA,
 		"context_trip", guard.peakTrip().String(), "cost_usd", obs.Cost)
 
 	return &Result{
@@ -406,6 +452,7 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 		FilesTouched: files,
 		Checkpoint:   checkpointSHA,
 		ContextTrip:  guard.peakTrip(),
+		TestVerdict:  verdict,
 	}, nil
 }
 

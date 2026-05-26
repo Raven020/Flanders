@@ -714,7 +714,7 @@ func TestComposePromptInjectsTaskFileAndSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	prompt, err := d.composePrompt(store.ByID("0007"), store)
+	prompt, err := d.composePrompt(store.ByID("0007"), store, "build")
 	if err != nil {
 		t.Fatalf("composePrompt: %v", err)
 	}
@@ -737,7 +737,7 @@ func TestComposePromptIncludesDependencyOutcomes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	prompt, err := d.composePrompt(store.ByID("0007"), store)
+	prompt, err := d.composePrompt(store.ByID("0007"), store, "build")
 	if err != nil {
 		t.Fatalf("composePrompt: %v", err)
 	}
@@ -765,7 +765,7 @@ func TestComposePromptExcludesUnrelatedTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	prompt, err := d.composePrompt(store.ByID("0007"), store)
+	prompt, err := d.composePrompt(store.ByID("0007"), store, "build")
 	if err != nil {
 		t.Fatalf("composePrompt: %v", err)
 	}
@@ -797,7 +797,7 @@ func TestComposePromptInjectsReferencedSpecExcerpts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	prompt, err := d.composePrompt(store.ByID("0001"), store)
+	prompt, err := d.composePrompt(store.ByID("0001"), store, "build")
 	if err != nil {
 		t.Fatalf("composePrompt: %v", err)
 	}
@@ -856,7 +856,7 @@ func TestComposePromptSkipsUnresolvableSpecRefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	prompt, err := d.composePrompt(store.ByID("0001"), store)
+	prompt, err := d.composePrompt(store.ByID("0001"), store, "build")
 	if err != nil {
 		t.Fatalf("composePrompt: %v", err)
 	}

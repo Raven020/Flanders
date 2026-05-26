@@ -40,17 +40,20 @@ import (
 // It is a method so it can resolve referenced spec files against the project root
 // (d.paths.Root) and log a skipped reference (d.log); the per-section builders below
 // stay pure free functions so they are unit-testable in isolation.
-func (d *Driver) composePrompt(t *task.Task, store *task.Store) (string, error) {
+//
+// phase selects the agent's role instruction at the top of the prompt (taskRoleHeader):
+// a build loop and a test loop run the same task-selected spine, but the build agent
+// implements while the test agent only ensures a failing acceptance test exists (spec 07
+// §test agent) — the rest of the body (task file, deps, excerpts, plan summary) is
+// identical, since both work the one selected task.
+func (d *Driver) composePrompt(t *task.Task, store *task.Store, phase string) (string, error) {
 	data, err := t.Bytes()
 	if err != nil {
 		return "", fmt.Errorf("serialize task file: %w", err)
 	}
 
 	var b strings.Builder
-	b.WriteString("# Current task: ")
-	b.WriteString(t.ID())
-	b.WriteString("\n\nWork this one task to completion in a single focused pass, then\n")
-	b.WriteString("update its `status` (`done`, or `blocked` with a `reason`).\n\n")
+	b.WriteString(taskRoleHeader(phase, t.ID()))
 	b.WriteString("## Task file (specs/tasks/")
 	b.WriteString(t.ID())
 	b.WriteString(")\n\n```markdown\n")
@@ -65,6 +68,53 @@ func (d *Driver) composePrompt(t *task.Task, store *task.Store) (string, error) 
 	b.WriteByte('\n')
 	return b.String(), nil
 }
+
+// taskRoleHeader is the phase-specific role instruction that opens a task loop's prompt
+// (plan task 4.4, spec 07 §test agent). The build and test loops run the same Iterate
+// spine over one selected task, but the agent's JOB differs: the build agent implements
+// until the acceptance test passes; the test agent ensures a FAILING acceptance test
+// exists and never implements — so it cannot weaken its own success criterion, which is
+// what makes the harness's ground-truth gate trustworthy. The `# Current task: <id>` H1
+// is shared (both prompts orient the agent the same way); the paragraph below it is the
+// per-phase contract. An unknown phase falls back to the build role — build and test are
+// the only task-loop phases (plan composes its own prompt, composePlanPrompt).
+func taskRoleHeader(phase, id string) string {
+	body := buildInstructions
+	if phase == "test" {
+		body = testInstructions
+	}
+	return "# Current task: " + id + "\n\n" + body
+}
+
+// buildInstructions is the BUILD agent's role: implement the one selected task until its
+// acceptance criterion passes the harness test command, then flip its status. It names the
+// test/implementer split (spec 07) so the build agent does not "fix" a red test by
+// weakening it instead of writing the code.
+const buildInstructions = "You are the BUILD agent — the implementer. Work this one task to " +
+	"completion in a single focused pass: write the code that makes its acceptance criterion " +
+	"pass the harness's test command. When you finish, update the task's `status` to `done` " +
+	"(or `blocked` with a `reason` if you genuinely cannot proceed). A separate test agent " +
+	"owns the acceptance test — do NOT weaken, delete, or skip it to make it pass; make the " +
+	"code satisfy it.\n\n"
+
+// testInstructions is the TEST agent's role (spec 07 §test agent, the always-on TDD
+// contract): ensure a FAILING acceptance test exists, never implement. The three branches
+// are the spec's verbatim — already-red (reuse), already-green (mark done, harness skips
+// build), no-test (write the smallest red test). The harness reads the resulting status +
+// its ground-truth gate to route (classifyTestVerdict); the agent's job is only to leave
+// the tree in one of these three states.
+const testInstructions = "You are the TEST agent. Your ONLY job is to ensure a FAILING (red) " +
+	"acceptance test exists for this task. You do NOT implement the feature, and you must never " +
+	"weaken, delete, or skip a test to make it pass. Do exactly one of:\n\n" +
+	"1. A test already exists and currently FAILS for the acceptance → reuse it, write nothing, " +
+	"and end (leave `status: pending`). The build agent will make it pass.\n" +
+	"2. A test already exists and PASSES for the acceptance (the behaviour is already " +
+	"implemented) → set this task's `status: done` and record which test covers it in `notes`. " +
+	"The harness will skip the build loop for this task.\n" +
+	"3. No test exists → write the SMALLEST test that encodes the acceptance criterion and " +
+	"currently FAILS (red); leave `status: pending`. The build agent will make it pass.\n\n" +
+	"Do not write production code. Delegate any codebase exploration to subagents to keep your " +
+	"own context lean.\n\n"
 
 // dependencyOutcomes summarizes the tasks the current one depends on — item 2 of the
 // composition (spec 01). The selector only runs a task once all its deps are `done`,
