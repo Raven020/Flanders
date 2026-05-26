@@ -274,7 +274,7 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 	// a trip, steers the running process — inject a graceful wind-down at soft_pct (when
 	// stream_input is on) and hard-kill at hard_pct. *supervise.Proc satisfies the guard's
 	// procController, so the hook hands it the live process to act on (see context_pressure.go).
-	guard := newContextGuard(d.cfg, d.log)
+	guard := newContextGuard(d.cfg, d.log, windDownMessage)
 	var raw bytes.Buffer
 	res, err := d.run(ctx, supervise.Spec{
 		Command:     cmd,

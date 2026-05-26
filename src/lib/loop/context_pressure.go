@@ -70,6 +70,7 @@ type procController interface {
 type contextGuard struct {
 	tracker     *stream.Tracker
 	streamInput bool
+	windDown    string // the tier-2 message injected at soft_pct (phase-specific; see newContextGuard)
 	log         *slog.Logger
 
 	mu       sync.Mutex
@@ -80,11 +81,16 @@ type contextGuard struct {
 
 // newContextGuard builds the guardrail for one loop from the project config. The tracker
 // is seeded with [context].window_tokens (0 ⇒ adopt the window the CLI reports at result
-// time) and the configured soft/hard fractions.
-func newContextGuard(cfg *config.Config, log *slog.Logger) *contextGuard {
+// time) and the configured soft/hard fractions. windDown is the tier-2 soft wind-down
+// message to inject at soft_pct: the task loop passes windDownMessage (which steers the
+// agent to self-block its task), the plan loop passes planWindDownMessage (which has no
+// task to block — it steers the agent to commit its task files and end). Keeping the
+// message a parameter is what lets one guard serve both loop shapes without a task ref.
+func newContextGuard(cfg *config.Config, log *slog.Logger, windDown string) *contextGuard {
 	return &contextGuard{
 		tracker:     stream.NewTracker(cfg.Context.WindowTokens, cfg.Context.SoftPct, cfg.Context.HardPct),
 		streamInput: cfg.Agent.StreamInput,
+		windDown:    windDown,
 		log:         log,
 	}
 }
@@ -138,7 +144,7 @@ func (g *contextGuard) handle(p procController, ev *stream.Event) {
 		if first {
 			g.log.Info("context-pressure: soft wind-down tripped — injecting wrap-up",
 				"occupancy", g.tracker.Occupancy(), "tokens", g.tracker.Tokens())
-			if err := p.Inject(windDownMessage); err != nil {
+			if err := p.Inject(g.windDown); err != nil {
 				// Best-effort: a failed inject (e.g. stdin already closed as the agent
 				// exits) just means the hard backstop will catch it if pressure keeps rising.
 				g.log.Warn("context-pressure: injecting wind-down failed", "err", err)

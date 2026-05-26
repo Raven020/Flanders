@@ -324,36 +324,11 @@ func (d *Driver) buildSummary(
 	vr *verify.Result,
 	files []string, // paths touched this loop, from git diff (empty if none / non-repo)
 ) *journal.Summary {
-	// Prefer the CLI's own reported duration (result.duration_ms) when present; fall
-	// back to the harness wall-clock (e.g. a killed loop never reports a duration).
-	durMS := res.Duration.Milliseconds()
-	if obs.DurationMS > 0 {
-		durMS = obs.DurationMS
-	}
-
-	sum := &journal.Summary{
-		Phase:      phase,
-		Task:       t.ID(),
-		SessionID:  sessionID,
-		StartedAt:  start,
-		EndedAt:    d.now(),
-		DurationMS: durMS,
-		Model:      class.Model,
-		Effort:     class.Effort,
-		Cost:       obs.Cost,
-		Tokens: journal.Tokens{
-			Input:         obs.FinalUsage.InputTokens,
-			Output:        obs.FinalUsage.OutputTokens,
-			CacheRead:     obs.FinalUsage.CacheReadInputTokens,
-			CacheCreation: obs.FinalUsage.CacheCreationInputTokens,
-		},
-		// StatusBefore is the status at selection — always `pending`, since Next only
-		// returns pending tasks (spec 01 §select). Recorded for an honest transition.
-		StatusBefore: t.Status(),
-		// Files touched this loop, inferred by the harness from git diff (spec 02);
-		// empty when nothing changed or the target is not a git repo.
-		Files: files,
-	}
+	sum := d.baseSummary(phase, sessionID, class, res, obs, start, outcome, files)
+	sum.Task = t.ID()
+	// StatusBefore is the status at selection — always `pending`, since Next only
+	// returns pending tasks (spec 01 §select). Recorded for an honest transition.
+	sum.StatusBefore = t.Status()
 
 	// Test records the ground-truth gate verdict (spec 01 §journal: "test result").
 	// vr is nil when the verify step did not run this loop (a non-code phase, or a
@@ -367,17 +342,60 @@ func (d *Driver) buildSummary(
 		}
 	}
 
-	for _, sa := range obs.Subagents {
-		sum.Subagents = append(sum.Subagents, journal.Subagent{Name: sa.SubagentType})
-	}
-
 	// StatusAfter / Reason come from `after`: the task as it stands once the agent's
 	// own mid-run edits and the harness's reconciliation (spec 02 §Mutation ownership)
 	// have both been applied. So the journal records the net, final transition for the
 	// loop — pending → (agent flip | harness promotion | normalization).
 	sum.StatusAfter = after.Status()
 	sum.Reason = after.Reason()
+	return sum
+}
 
+// baseSummary fills the phase-agnostic half of a journal record — the fields every loop
+// has regardless of whether it targets one task (build/test) or the whole spec set
+// (plan): timing, model/effort, cost, token totals, subagents, the files touched, and
+// the one-line error text. buildSummary (task loops) and buildPlanSummary (the plan
+// loop) both start here and then add only their phase-specific fields, so the mapping
+// from a LoopObservation onto the on-disk journal schema lives in exactly one place.
+func (d *Driver) baseSummary(
+	phase string,
+	sessionID string,
+	class config.AgentClass,
+	res *supervise.Result,
+	obs *stream.LoopObservation,
+	start time.Time,
+	outcome stream.Outcome,
+	files []string,
+) *journal.Summary {
+	// Prefer the CLI's own reported duration (result.duration_ms) when present; fall
+	// back to the harness wall-clock (e.g. a killed loop never reports a duration).
+	durMS := res.Duration.Milliseconds()
+	if obs.DurationMS > 0 {
+		durMS = obs.DurationMS
+	}
+
+	sum := &journal.Summary{
+		Phase:      phase,
+		SessionID:  sessionID,
+		StartedAt:  start,
+		EndedAt:    d.now(),
+		DurationMS: durMS,
+		Model:      class.Model,
+		Effort:     class.Effort,
+		Cost:       obs.Cost,
+		Tokens: journal.Tokens{
+			Input:         obs.FinalUsage.InputTokens,
+			Output:        obs.FinalUsage.OutputTokens,
+			CacheRead:     obs.FinalUsage.CacheReadInputTokens,
+			CacheCreation: obs.FinalUsage.CacheCreationInputTokens,
+		},
+		// Files touched this loop, inferred by the harness from git diff (spec 02);
+		// empty when nothing changed or the target is not a git repo.
+		Files: files,
+	}
+	for _, sa := range obs.Subagents {
+		sum.Subagents = append(sum.Subagents, journal.Subagent{Name: sa.SubagentType})
+	}
 	sum.Error = errorText(res, obs, outcome)
 	return sum
 }

@@ -60,7 +60,7 @@ func (f *fakeProc) killCount() int {
 func newGuard(streamInput bool) *contextGuard {
 	cfg := config.Default()
 	cfg.Agent.StreamInput = streamInput
-	return newContextGuard(&cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return newContextGuard(&cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), windDownMessage)
 }
 
 // usageEvent builds a lead-agent assistant event carrying `total` input tokens —

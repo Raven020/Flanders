@@ -35,14 +35,30 @@ import (
 // spec 03). An interactive offer is a TUI concern (Phase 6); at the engine level the
 // config flag governs, so an unattended run is never blocked waiting for an answer.
 func (d *Driver) checkpoint(ctx context.Context, phase string, iter int, before, after *task.Task, vr *verify.Result) string {
+	// Progress for a task loop (spec 03 [git].commit_each): a status change OR a passing
+	// test gate. The selector always hands a `pending` task, so a status change is simply
+	// before.Status() != after.Status() (a flip to done/blocked, or a harness
+	// promotion/normalization in src/lib/reconcile).
+	statusChanged := before.Status() != after.Status()
+	testsPassed := vr != nil && vr.Passed()
+	return d.commit(ctx, phase, iter, after.ID(), string(after.Status()), statusChanged || testsPassed)
+}
+
+// commit is the checkpoint core shared by the task loop (checkpoint) and the plan loop
+// (planCheckpoint). It honors [git].enabled/commit_each, ensures a repo
+// (init_if_missing), renders the [git].message_tmpl, and commits the working tree —
+// returning the new commit sha, or "" when no commit was made. The only thing that
+// differs between the two loops is what counts as "progress" (a task-status flip vs.
+// new/changed task files) and the {task}/{result} message variables, so those are
+// passed in; everything else (the modes, repo-init, best-effort error handling) is one
+// implementation here. progress gates commit_each="progress"; "iteration" commits any
+// tree change regardless; "off" (or [git].enabled=false) never commits.
+func (d *Driver) commit(ctx context.Context, phase string, iter int, taskID, result string, progress bool) string {
 	g := d.cfg.Git
 	if !g.Enabled || g.CommitEach == "off" {
 		return ""
 	}
-
-	statusChanged := before.Status() != after.Status()
-	testsPassed := vr != nil && vr.Passed()
-	if g.CommitEach == "progress" && !(statusChanged || testsPassed) {
+	if g.CommitEach == "progress" && !progress {
 		return ""
 	}
 
@@ -62,19 +78,19 @@ func (d *Driver) checkpoint(ctx context.Context, phase string, iter int, before,
 		d.log.Info("checkpoint: initialized git repo for target", "root", d.paths.Root)
 	}
 
-	msg := renderCheckpointMessage(g.MessageTmpl, phase, iter, after.ID(), string(after.Status()))
+	msg := renderCheckpointMessage(g.MessageTmpl, phase, iter, taskID, result)
 	sha, committed, err := git.Checkpoint(ctx, d.paths.Root, msg)
 	if err != nil {
-		d.log.Warn("checkpoint: commit failed", "phase", phase, "task", after.ID(), "err", err)
+		d.log.Warn("checkpoint: commit failed", "phase", phase, "task", taskID, "err", err)
 		return ""
 	}
 	if !committed {
-		// Progress was recorded (status flip), but the tree was already clean — e.g.
-		// the agent committed its own work. Not a failure; just nothing left to do.
-		d.log.Debug("checkpoint: nothing to commit", "phase", phase, "task", after.ID())
+		// Progress was recorded, but the tree was already clean — e.g. the agent
+		// committed its own work. Not a failure; just nothing left to do.
+		d.log.Debug("checkpoint: nothing to commit", "phase", phase, "task", taskID)
 		return ""
 	}
-	d.log.Info("checkpoint committed", "phase", phase, "task", after.ID(), "sha", sha, "message", msg)
+	d.log.Info("checkpoint committed", "phase", phase, "task", taskID, "sha", sha, "message", msg)
 	return sha
 }
 

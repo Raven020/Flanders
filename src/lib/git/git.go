@@ -81,8 +81,15 @@ func HeadSHA(ctx context.Context, dir string) string {
 // staged, deleted, renamed, and untracked files — from `git status --porcelain`.
 // A set (map) is returned because the only questions asked of it are membership and
 // equality between two snapshots ([Diff]); an empty map means a clean tree.
+//
+// --untracked-files=all is passed so a brand-new, entirely-untracked directory is
+// reported as its individual files (e.g. `specs/tasks/0001-foo.md`), not collapsed to
+// the directory (`specs/tasks/`) as the default `normal` mode does. The harness's
+// "which files did this loop touch" signal — the journal Files field and stall
+// detection — needs per-file granularity, which matters most for the very first plan
+// loop creating the first task files in a fresh tasks dir.
 func WorkingChanges(ctx context.Context, dir string) (map[string]struct{}, error) {
-	out, err := run(ctx, dir, "status", "--porcelain")
+	out, err := run(ctx, dir, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return nil, err
 	}
