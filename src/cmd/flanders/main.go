@@ -20,13 +20,14 @@ import (
 	"flanders/src/lib/journal"
 	"flanders/src/lib/logging"
 	"flanders/src/lib/paths"
+	"flanders/src/lib/rules"
 	"flanders/src/lib/state"
 	"flanders/src/lib/task"
 )
 
 // Version is the harness version, bumped on each green build (PROMPT rule:
 // start at 0.0.0 and increment patch).
-const Version = "0.0.19"
+const Version = "0.0.20"
 
 const usage = `usage: flanders [command]
 
@@ -98,6 +99,20 @@ func initAt(root string, w io.Writer) error {
 		fmt.Fprintf(w, "flanders: wrote default config to %s\n", p.Config)
 	} else {
 		fmt.Fprintf(w, "flanders: config already exists at %s (not overwriting)\n", p.Config)
+	}
+
+	// Materialize the loop rules alongside the config so the user can read and tune
+	// the agent's behavioral contract (specs/01 §invocation). Like the config, this
+	// never overwrites an existing file; and the loop falls back to the same built-in
+	// default when the file is absent, so the rules are always in force regardless.
+	wroteRules, err := rules.WriteDefault(p.Rules)
+	if err != nil {
+		return err
+	}
+	if wroteRules {
+		fmt.Fprintf(w, "flanders: wrote default loop rules to %s\n", p.Rules)
+	} else {
+		fmt.Fprintf(w, "flanders: loop rules already exist at %s (not overwriting)\n", p.Rules)
 	}
 	return nil
 }

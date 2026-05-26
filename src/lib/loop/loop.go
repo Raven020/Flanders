@@ -70,6 +70,7 @@ import (
 	"flanders/src/lib/journal"
 	"flanders/src/lib/paths"
 	"flanders/src/lib/reconcile"
+	"flanders/src/lib/rules"
 	"flanders/src/lib/stream"
 	"flanders/src/lib/supervise"
 	"flanders/src/lib/task"
@@ -223,7 +224,8 @@ func (d *Driver) Iterate(ctx context.Context, phase string, iter int) (*Result, 
 
 	// 2. COMPOSE — the prompt body for this task (task file + dependency outcomes +
 	// referenced spec excerpts + one-line plan summary), plus the loop rules appended
-	// as a system prompt. Rules are optional until plan task 3.3 authors them.
+	// as a system prompt (readRules: the project's .flanders/rules.md, or the built-in
+	// default when that file is absent — the rules are always in force).
 	prompt, err := d.composePrompt(t, store)
 	if err != nil {
 		return nil, fmt.Errorf("loop: compose prompt for task %s: %w", t.ID(), err)
@@ -371,14 +373,18 @@ func (d *Driver) runsTestGate(phase string, outcome stream.Outcome) bool {
 }
 
 // readRules returns the loop-rules text appended to the agent's system prompt
-// (spec 01 §Agent invocation). The rules file (paths.Rules, default
-// .flanders/rules.md) is authored by plan task 3.3; until it exists an absent file
-// is normal and yields "" (invoke.Build then omits --append-system-prompt). Any
-// other read error is real and surfaced.
+// (spec 01 §Agent invocation). It reads the rules file (paths.Rules, default
+// .flanders/rules.md) when present — that is the user-tunable copy `flanders init`
+// writes. When the file is absent it falls back to the built-in rules.DefaultMarkdown
+// rather than "", so the agent's loop contract is ALWAYS in force (mirroring how
+// config falls back to its documented defaults): a project that never ran init, or
+// one whose rules file was removed, still gets the one-task-per-loop / flip-status /
+// don't-touch-harness-state / delegate-to-subagents / proactive-handoff discipline.
+// Any read error other than not-exist is real and surfaced.
 func (d *Driver) readRules() (string, error) {
 	data, err := os.ReadFile(d.paths.Rules)
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", nil
+		return rules.DefaultMarkdown, nil
 	}
 	if err != nil {
 		return "", err

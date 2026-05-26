@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"flanders/src/lib/config"
+	"flanders/src/lib/rules"
 )
 
 // TestDispatchUnknownCommand must reject an unknown command word with a usage
@@ -52,6 +53,19 @@ func TestInitAtWritesLoadableConfig(t *testing.T) {
 	}
 	if err := cfg.ValidateForBuild(); err != nil {
 		t.Errorf("init'd config failed ValidateForBuild: %v", err)
+	}
+
+	// init must also materialize the loop rules so the user can read/tune them.
+	if !strings.Contains(out.String(), "wrote default loop rules") {
+		t.Errorf("init output = %q, want a 'wrote default loop rules' message", out.String())
+	}
+	rulesPath := filepath.Join(root, ".flanders", "rules.md")
+	gotRules, err := os.ReadFile(rulesPath)
+	if err != nil {
+		t.Fatalf("read init'd rules: %v", err)
+	}
+	if string(gotRules) != rules.DefaultMarkdown {
+		t.Errorf("init'd rules differ from the built-in default")
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"flanders/src/lib/journal"
 	"flanders/src/lib/paths"
 	"flanders/src/lib/reconcile"
+	"flanders/src/lib/rules"
 	"flanders/src/lib/stream"
 	"flanders/src/lib/supervise"
 	"flanders/src/lib/task"
@@ -642,6 +643,48 @@ func TestIterateNonRepoNoGitSignal(t *testing.T) {
 	}
 	if res.WorkHappened || res.FilesTouched != nil {
 		t.Errorf("non-repo: WorkHappened=%v Files=%v, want false/nil", res.WorkHappened, res.FilesTouched)
+	}
+}
+
+// TestReadRulesFallsBackToDefault: with no .flanders/rules.md on disk, the loop must
+// still apply the built-in loop discipline (spec 01 §invocation) — the rules are
+// never silently empty just because the project skipped `flanders init`.
+func TestReadRulesFallsBackToDefault(t *testing.T) {
+	cfg, p, jr := setupProject(t)
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, statErr := os.Stat(p.Rules); !os.IsNotExist(statErr) {
+		t.Fatalf("precondition: rules file should not exist, stat err = %v", statErr)
+	}
+	got, err := d.readRules()
+	if err != nil {
+		t.Fatalf("readRules: %v", err)
+	}
+	if got != rules.DefaultMarkdown {
+		t.Errorf("readRules with no file = %q, want the built-in default", got)
+	}
+}
+
+// TestReadRulesReadsFile: when the project has a rules file (e.g. a user's tuned copy
+// or the one `flanders init` wrote), the loop uses that file's contents verbatim.
+func TestReadRulesReadsFile(t *testing.T) {
+	cfg, p, jr := setupProject(t)
+	d, err := New(Options{Config: cfg, Paths: p, Journal: jr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	custom := "# project rules\n\nAlways do X.\n"
+	if err := os.WriteFile(p.Rules, []byte(custom), 0o644); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	got, err := d.readRules()
+	if err != nil {
+		t.Fatalf("readRules: %v", err)
+	}
+	if got != custom {
+		t.Errorf("readRules = %q, want the file's contents %q", got, custom)
 	}
 }
 
